@@ -1,0 +1,8 @@
+# Multi-file deep-merge override: overrides MERGE_B and adds MERGE_C, without
+# touching MERGE_A. Layered on top of compose-merge-base.yaml.
+name: cme
+services:
+  app:
+    environment:
+      MERGE_B: override_b
+      MERGE_C: c

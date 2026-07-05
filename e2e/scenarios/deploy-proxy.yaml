@@ -1,0 +1,19 @@
+# Enforcing-proxy isolation. mesh is a proxy network (driver_opts.proxy=true):
+# web + client on mesh may reach each other; outsider is on a different (plain)
+# network, so client must NOT be able to reach it even by its resolved IP.
+services:
+  web:
+    image: nginx:alpine
+    networks: [mesh]
+  client:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [mesh]
+  outsider:
+    image: nginx:alpine
+    networks: [other]
+networks:
+  mesh:
+    driver_opts:
+      proxy: "true"
+  other:

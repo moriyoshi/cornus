@@ -1,0 +1,28 @@
+# Two services sharing ONE emulated-ingress host (shared.example.com) but rooted at
+# different paths: web-api at /api, web-root at /. This is the configuration that must
+# resolve by LONGEST path match — like a real Kubernetes ingress — rather than the
+# second-registered ingress shadowing the first.
+#
+# traefik/whoami answers 200 on every path and prints its own `Hostname:` (which
+# compose `hostname:` sets on both docker and kube), so a response tells us which
+# backend served the request. Public image, no build, so it runs on docker + kube.
+name: e2e
+services:
+  web-root:
+    image: traefik/whoami
+    hostname: backend-root
+    ports:
+      - "8080:80"
+    x-cornus-ingress:
+      hosts:
+        - shared.example.com
+      path: /
+  web-api:
+    image: traefik/whoami
+    hostname: backend-api
+    ports:
+      - "8081:80"
+    x-cornus-ingress:
+      hosts:
+        - shared.example.com
+      path: /api

@@ -1,0 +1,17 @@
+# Client-side egress, mode "env": the caller's proxy settings are propagated into
+# the container. Explicit `proxies:` keep this deterministic (independent of the
+# harness host's own OS proxy config). A `cluster`-route rule folds its pattern into
+# NO_PROXY so in-cluster destinations bypass the proxy.
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    x-cornus-egress:
+      mode: env
+      proxies:
+        HTTP_PROXY: "http://proxy.example:8080"
+        HTTPS_PROXY: "http://proxy.example:8080"
+        NO_PROXY: "10.0.0.0/8"
+      rules:
+        - pattern: "*.svc.cluster.local"
+          route: cluster

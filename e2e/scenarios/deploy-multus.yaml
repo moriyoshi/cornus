@@ -1,0 +1,14 @@
+# Two services on a `bridge`-driver network. On kubernetes with Multus present,
+# the netdriver realises this as a NetworkAttachmentDefinition + an overlaid
+# secondary bridge interface on each pod.
+services:
+  a:
+    image: nginx:alpine
+    networks: [mesh]
+  b:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [mesh]
+networks:
+  mesh:
+    driver: bridge

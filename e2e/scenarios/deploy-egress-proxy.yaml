@@ -1,0 +1,31 @@
+# Client-side egress, mode "proxy" (kube): the caretaker runs a loopback HTTP proxy
+# (CONNECT + absolute-form forwarding) and SOCKS5; the app's injected HTTP_PROXY
+# points at it. Same default-route differential as the transparent scenario: three
+# apps share a network with `web` (nginx) and differ only in their default route.
+services:
+  web:
+    image: nginx:alpine
+    networks: [egrnet]
+  app-direct:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: proxy
+      default: cluster
+  app-relay:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: proxy
+      default: client
+  app-deny:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: proxy
+      default: deny
+networks:
+  egrnet:

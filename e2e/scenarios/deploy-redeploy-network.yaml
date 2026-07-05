@@ -1,0 +1,12 @@
+# A SINGLE service on its own (sole-member) user-defined network, with a
+# published port. compose always joins the service to the implicit
+# <project>_default network, so `web` is the only member of `rdnet_default`.
+# A redeploy (a second `compose up`, which re-applies the spec) used to reap
+# this sole-member network mid-Apply on the host backends and then fail to
+# recreate the instance — see deploy-redeploy-network.star.
+name: rdnet
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "18091:80"

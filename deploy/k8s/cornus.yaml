@@ -1,0 +1,227 @@
+# cornus as a first-class Kubernetes service.
+#
+#   kubectl apply -f deploy/k8s/cornus.yaml
+#
+# Uses the pre-built multi-arch image from GHCR (published by the release
+# workflow on v* tags). Swap the image line to run a locally built one.
+#
+# Runs as a StatefulSet so the registry CAS and build cache persist across pod
+# restarts (PVC). The build engine needs elevated privileges to run runc +
+# overlayfs; this manifest uses privileged: true. For restrictive clusters, see
+# the README "Privilege posture" for the rootless alternative.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cornus
+  labels:
+    app: cornus
+---
+# RBAC for the (pluggable) kubernetes deploy backend, so cornus can manage
+# workloads in its own namespace when running in-cluster.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cornus
+  labels:
+    app: cornus
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # One-shot / init compose services (restart: "no" or "on-failure") become
+  # Jobs instead of Deployments; see pkg/deploy/kubernetes/job.go.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Managed volumes become PersistentVolumeClaims: reconcile creates the PVC
+  # backing each volume (owned by the Deployment for anonymous volumes, un-owned
+  # for named ones), and `compose down --volumes` deletes named-volume PVCs.
+  # Without this grant, deploying any service with a volume fails at reconcile.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # A workload with a NATIVE / real x-cornus-ingress (as opposed to the client-
+  # emulated conduit ingress, which creates no server object) makes the deploy
+  # backend create/update an Ingress fronting the workload's own Service, GC'd with
+  # the workload via its owner reference. Without this grant, deploying such a service
+  # fails at reconcile with `ingresses.networking.k8s.io is forbidden`. Granted here
+  # because this manifest is the batteries-included example (it likewise grants the
+  # TLS Secrets below unconditionally); the Helm chart gates BOTH behind opt-in values
+  # (ingress.manageIngresses / ingress.manageTLSSecrets) for least privilege. Drop
+  # this rule if you only use client-emulated ingress.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pod subresources proxied through the cornus server: logs (compose logs) and
+  # the streaming exec / attach / port-forward endpoints. In Kubernetes RBAC a
+  # subresource is a separate grant from "pods" itself, so without these
+  # `cornus compose logs`, `cornus exec`, and `cornus port-forward` fail
+  # server-side with a forbidden error. (A cluster CLI can also reach pods
+  # directly with the user's kubeconfig; these make the server path work too.)
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+  # Multi-replica hub (CORNUS_HUB_STORE=kube): the Kubernetes-native hub store
+  # writes provider records as HubEndpoint CRs and renews a per-replica Lease.
+  - apiGroups: ["cornus.dev"]
+    resources: ["hubendpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Ingress TLS: a workload with an ingress TLS block carrying inline (managed)
+  # certificates makes the deploy backend create/update the backing
+  # kubernetes.io/tls Secrets and prune obsolete ones by label selector; see
+  # applyManagedIngressTLSSecrets in pkg/deploy/kubernetes/kubernetes.go. Without
+  # this grant, `cornus compose` with an ingress TLS config fails at deploy time.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cornus
+  labels:
+    app: cornus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cornus
+subjects:
+  - kind: ServiceAccount
+    name: cornus
+---
+# Cluster-scoped RBAC for the multi-replica hub store's CRD self-install. The
+# HubEndpoint CustomResourceDefinition is cluster-scoped, so creating (and reading)
+# it needs a ClusterRole. Only needed when running the hub with CORNUS_HUB_STORE=kube;
+# harmless otherwise.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cornus-hub-crd
+  labels:
+    app: cornus
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cornus-hub-crd
+  labels:
+    app: cornus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cornus-hub-crd
+subjects:
+  - kind: ServiceAccount
+    name: cornus
+    namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cornus
+  labels:
+    app: cornus
+spec:
+  # NodePort so a cluster node pulls built images through kube-proxy's node port
+  # binding (reachable on every node, including via localhost on the node itself),
+  # rather than depending on a developer's `kubectl port-forward`. The server
+  # advertises localhost:30500 at GET /.cornus/v1/info, so deploy refs are pullable by the
+  # node with no forward. The same node port also serves the CLI's control-plane
+  # calls, so the quick start needs no port-forward at all.
+  type: NodePort
+  selector:
+    app: cornus
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      nodePort: 30500
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cornus
+  labels:
+    app: cornus
+spec:
+  serviceName: cornus
+  # This pinned manifest is single-replica by design. For a multi-replica hub
+  # (CORNUS_HUB_STORE=kube, headless peer Service, shared s3:// storage), use
+  # the Helm chart under deploy/helm/cornus and set replicas > 1.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cornus
+  template:
+    metadata:
+      labels:
+        app: cornus
+    spec:
+      serviceAccountName: cornus
+      containers:
+        - name: cornus
+          image: ghcr.io/moriyoshi/cornus:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--addr", ":5000"]
+          ports:
+            - name: http
+              containerPort: 5000
+          env:
+            - name: CORNUS_DATA
+              value: /var/lib/cornus
+            # Deploy workloads into this cluster (the Role above grants the
+            # verbs). Without this the server would default to the dockerhost
+            # backend, which cannot work in a pod with no Docker socket.
+            - name: CORNUS_DEPLOY_BACKEND
+              value: kubernetes
+            # Deploy into the namespace this manifest was applied to — the
+            # same one holding the Role/RoleBinding above. Without this the
+            # server falls back to the "default" namespace, so RBAC only
+            # lines up for installs in default. (The ClusterRoleBinding's
+            # subject namespace is pinned to "default"; adjust it if you
+            # apply this manifest into another namespace.)
+            - name: CORNUS_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            # Required for the in-process build engine (runc + overlayfs).
+            # Restrictive clusters: drop privileged and use rootless (README).
+            privileged: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cornus
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 5000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

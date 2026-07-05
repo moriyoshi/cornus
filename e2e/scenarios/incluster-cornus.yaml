@@ -1,0 +1,130 @@
+# In-cluster cornus for the port-forward E2E: cornus itself running as a Deployment
+# behind a ClusterIP Service, so a `port-forward` connection profile can reach it
+# via svcforward (no host-run server, no published port). Applied with
+# `kubectl -n <ns> apply -f` by incluster-portforward.star. Uses the cornus:e2e
+# image that the containerized e2e flow's prepare_kube loads into kind.
+#
+# No auth here (the svcforward path is what this proves); the kube-auth variant is
+# incluster-cornus-auth.yaml. Not privileged: this instance only runs the registry
+# + API + kubernetes deploy backend, never the in-process build engine.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cornus-incluster
+  labels: {app: cornus-incluster}
+---
+# RBAC for the kubernetes deploy backend to manage workloads in this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cornus-incluster
+  labels: {app: cornus-incluster}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Managed-volume PVCs and native (real) Ingress objects — the deploy-dependent
+  # resources the incluster-ingress scenario exercises. The whole point of running
+  # the server in-cluster under a real Role (rather than the host target's admin
+  # kubeconfig) is that a grant missing HERE fails the deploy, so a production-RBAC
+  # gap that admin-kubeconfig E2E would mask is caught. Drop either and
+  # incluster-ingress.star fails with `forbidden` — exactly the production symptom.
+  #
+  # This mirrors production as configured for NATIVE ingress: pvcs is unconditional
+  # in the production Role, and ingresses matches the opt-in `ingress.manageIngresses`
+  # grant (Helm) / the batteries-included k8s manifest. An EMULATED ingress needs
+  # NEITHER (the client runs the proxy; the backend creates no server object — see
+  # TestApplyClientEmulatedIngressCreatesNoObject and socks5-ingress-tls.star), so a
+  # default install without this ingresses grant still serves the emulate workflow.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pod subresources for server-proxied logs / exec / attach / port-forward
+  # (a subresource is a separate RBAC grant from "pods").
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cornus-incluster
+  labels: {app: cornus-incluster}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cornus-incluster
+subjects:
+  - kind: ServiceAccount
+    name: cornus-incluster
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cornus-incluster
+  labels: {app: cornus-incluster}
+spec:
+  selector: {app: cornus-incluster}
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cornus-incluster
+  labels: {app: cornus-incluster}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cornus-incluster}
+  template:
+    metadata:
+      labels: {app: cornus-incluster}
+    spec:
+      serviceAccountName: cornus-incluster
+      containers:
+        - name: cornus
+          image: cornus:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--addr", ":5000"]
+          ports:
+            - containerPort: 5000
+          env:
+            - name: CORNUS_DATA
+              value: /var/lib/cornus
+            # Deploy workloads into this cluster (the Role above grants the verbs).
+            - name: CORNUS_DEPLOY_BACKEND
+              value: kubernetes
+            # Deploy into this pod's own namespace.
+            - name: CORNUS_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cornus
+          readinessProbe:
+            httpGet: {path: /readyz, port: 5000}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: 5000}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: data
+          emptyDir: {}

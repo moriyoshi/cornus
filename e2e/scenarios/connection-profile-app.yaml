@@ -1,0 +1,9 @@
+# Minimal public-image project for the connection-profile scenario: deployed
+# purely via a stored `cornus config` profile (no -H/--host). A distinct project
+# name and no published ports keep it isolated from the compose scenario (no host
+# port-binding collisions); nginx's default command serves, so no command override
+# is needed and it stays backend-agnostic.
+name: profile
+services:
+  web:
+    image: nginx:1.27-alpine
