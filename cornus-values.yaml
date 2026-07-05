@@ -1,0 +1,3 @@
+deployBackend: kubernetes
+registry:
+  exposure: nodePort

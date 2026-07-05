@@ -1,0 +1,442 @@
+{
+  "README": [
+    "Screens the dev mock replays so every agent cornus can classify has something to look at.",
+    "",
+    "One entry is one moment of one agent's terminal: the OSC window title it sets, the lines it",
+    "paints, and the state the bundled manifest classifies that into. The mock plays an agent's",
+    "entries in order (working, then blocked awaiting an answer, then idle) and REPORTS THE STATE",
+    "FROM THE ENTRY rather than inventing one — see startAgentDemo in faketerm.ts.",
+    "",
+    "That is only honest if the entries are true, so they are checked from the Go side, twice:",
+    "  pkg/agentdetect/screens_test.go            the declared rule is the one that fires",
+    "  cmd/cornus/internal/webbff/agentscreens_test.go   the same bytes through a real session",
+    "The second is the one that makes 'end to end' mean anything: it renders the screen on the",
+    "same headless VT100 the BFF uses, sniffs the title off the same OSC scanner, and reads the",
+    "state off the session list — so an entry that only classifies as a bare string does not pass.",
+    "",
+    "Authoring rules, each learned from a failure:",
+    "  - No trailing whitespace on a screen line. The renderer right-trims every row, so a line",
+    "    with one would reach the two checks differently.",
+    "  - At most 12 lines. detBottomLines keeps only the last 12 rows; lines above that are",
+    "    invisible to the detector and would make an entry pass for a reason the mock cannot show.",
+    "  - Keep lines under 80 columns, the detector's default screen width. A wrapped line is a",
+    "    different line, and a rule anchored with ^ or $ stops matching it.",
+    "  - `rule` names the rule that must WIN, not merely one that matches. Several rules can fire",
+    "    on one screen; asserting the winner is what catches a screen that lands on the right",
+    "    state through the wrong evidence.",
+    "  - An agent whose manifest reads its state off the OSC title (amp, claude, codex, grok,",
+    "    hermes) needs a title that agrees with the state on EVERY entry. The detector never",
+    "    clears a title it has seen, so a stale working title outranks the next screen."
+  ],
+  "screens": [
+    {
+      "agent": "amp",
+      "state": "working",
+      "rule": "status_footer_working",
+      "title": "amp — refactor payments",
+      "screen": [
+        "▌ Refactoring src/payments/adapter.ts",
+        "▌ 3 files read · 1 edit applied",
+        "╰ ● thinking ─────────────────────────────"
+      ]
+    },
+    {
+      "agent": "amp",
+      "state": "blocked",
+      "rule": "approval_footer",
+      "title": "amp — waiting for you",
+      "screen": [
+        "▌ amp wants to run:",
+        "▌   git push --force origin main",
+        "waiting for approval",
+        "[a] approve   [d] deny with feedback"
+      ]
+    },
+    {
+      "agent": "amp",
+      "state": "idle",
+      "rule": "osc_title_idle",
+      "title": "cornus - amp - ready",
+      "screen": ["▌ Done. 3 files changed, 12 tests passing."]
+    },
+
+    {
+      "agent": "agy",
+      "state": "working",
+      "rule": "spinner_working",
+      "title": "antigravity",
+      "screen": ["⠹ Analyzing the repository", "  src/server.go · src/router.go"]
+    },
+    {
+      "agent": "agy",
+      "state": "blocked",
+      "rule": "permission_prompt",
+      "title": "antigravity — permission",
+      "screen": [
+        "antigravity is requesting permission for:",
+        "  Bash(rm -rf ./dist)",
+        "",
+        "Do you want to proceed?",
+        "❯ 1. Yes   2. No"
+      ]
+    },
+
+    {
+      "agent": "claude",
+      "state": "working",
+      "rule": "osc_title_working",
+      "title": "⠹ Claude Code",
+      "screen": [
+        "✻ Refactoring the payment adapter…",
+        "  Read src/payments/adapter.ts (412 lines)",
+        "  Edited src/payments/adapter.ts"
+      ]
+    },
+    {
+      "agent": "claude",
+      "state": "blocked",
+      "rule": "bash_permission_prompt",
+      "title": "Claude Code",
+      "screen": [
+        "Bash command",
+        "  rm -rf ./build",
+        "",
+        "Do you want to proceed?",
+        "❯ 1. Yes",
+        "  2. No, and tell Claude what to do differently"
+      ]
+    },
+    {
+      "agent": "claude",
+      "state": "idle",
+      "rule": "live_prompt_box",
+      "title": "✳ Claude Code",
+      "screen": [
+        "  Done. 2 files changed, 1 test added.",
+        "──────────────────────────────────────────",
+        " ❯",
+        "──────────────────────────────────────────",
+        "  ? for shortcuts"
+      ]
+    },
+
+    {
+      "agent": "cline",
+      "state": "working",
+      "rule": "default_cline_working",
+      "title": "cline",
+      "screen": ["[ACT MODE] Editing src/hooks/useOrders.ts", "  2 of 4 steps complete"]
+    },
+    {
+      "agent": "cline",
+      "state": "blocked",
+      "rule": "tool_permission",
+      "title": "cline — approval",
+      "screen": [
+        "Cline wants to run a command:",
+        "  npm run migrate:prod",
+        "[ACT MODE] execute command?",
+        "  Yes   No"
+      ]
+    },
+
+    {
+      "agent": "codex",
+      "state": "working",
+      "rule": "screen_working_fallback",
+      "title": "codex",
+      "screen": [
+        "> refactor the payment adapter",
+        "  Reading src/payments/adapter.ts",
+        "• Working (12s · esc to interrupt)"
+      ]
+    },
+    {
+      "agent": "codex",
+      "state": "blocked",
+      "rule": "live_strong_blocker",
+      "title": "codex",
+      "screen": ["codex wants to run:", "  git push --force", "allow command?", "  1. Yes   2. No"]
+    },
+    {
+      "agent": "codex",
+      "state": "idle",
+      "rule": "osc_title_idle",
+      "title": "codex — cornus",
+      "screen": ["  Ready when you are.", "  Type a message, or /help for commands."]
+    },
+
+    {
+      "agent": "copilot",
+      "state": "working",
+      "rule": "working_cancel_hint",
+      "title": "GitHub Copilot CLI",
+      "screen": ["Copilot is editing src/router.ts", "  Esc to cancel"]
+    },
+    {
+      "agent": "copilot",
+      "state": "blocked",
+      "rule": "selection_blocker",
+      "title": "Copilot — confirm",
+      "screen": ["Copilot wants to run: npm publish", "  Enter to confirm   Esc to cancel"]
+    },
+
+    {
+      "agent": "cursor",
+      "state": "working",
+      "rule": "stop_hint_working",
+      "title": "cursor-agent",
+      "screen": ["Editing src/api/client.ts", "  ctrl+c to stop"]
+    },
+    {
+      "agent": "cursor",
+      "state": "blocked",
+      "rule": "write_file_approval",
+      "title": "cursor-agent — approve",
+      "screen": [
+        "cursor wants to write to this file?",
+        "  src/api/client.ts (+18 −4)",
+        "  proceed (y)   reject & propose changes (p)"
+      ]
+    },
+
+    {
+      "agent": "devin",
+      "state": "working",
+      "rule": "running_tools_footer",
+      "title": "devin",
+      "screen": ["Devin is exploring the repository", "  running tools · esc to interrupt"]
+    },
+    {
+      "agent": "devin",
+      "state": "blocked",
+      "rule": "permission_prompt",
+      "title": "devin — approve",
+      "screen": [
+        "Devin wants to run: terraform apply",
+        "  ❭ approve once",
+        "    always approve",
+        "  select · confirm · esc cancel"
+      ]
+    },
+    {
+      "agent": "devin",
+      "state": "idle",
+      "rule": "live_prompt_footer",
+      "title": "devin",
+      "screen": ["❭ what should I look at next?", "  context: 12% · main"]
+    },
+
+    {
+      "agent": "droid",
+      "state": "working",
+      "rule": "spinner_stop_working",
+      "title": "droid",
+      "screen": ["⠹ Running the test suite", "  esc to stop"]
+    },
+    {
+      "agent": "droid",
+      "state": "blocked",
+      "rule": "execute_selection_blocker",
+      "title": "droid — approve",
+      "screen": [
+        "droid wants to execute: rm -rf ./tmp",
+        "  > Yes, allow",
+        "    No, cancel",
+        "  ↑↓ to navigate · enter to select · esc to cancel"
+      ]
+    },
+
+    {
+      "agent": "gemini",
+      "state": "working",
+      "rule": "esc_cancel_working",
+      "title": "gemini",
+      "screen": ["Gemini is reading src/main.go", "  (esc to cancel)"]
+    },
+    {
+      "agent": "gemini",
+      "state": "blocked",
+      "rule": "apply_or_allow_change",
+      "title": "gemini — confirm",
+      "screen": [
+        "│ Apply this change to src/main.go?",
+        "│   1. Yes, apply",
+        "│   2. No, keep it"
+      ]
+    },
+
+    {
+      "agent": "grok",
+      "state": "working",
+      "rule": "osc_title_working",
+      "title": "⠧ Waiting on subagent… - grok build",
+      "screen": [
+        "⠧ Waiting on subagent… 2.8s   13s ⇣29.7k [stop]",
+        "  Esc:cancel │ Ctrl+.:shortcuts"
+      ]
+    },
+    {
+      "agent": "grok",
+      "state": "blocked",
+      "rule": "option_dialog_blocked",
+      "title": "grok build - cornus",
+      "screen": [
+        "┃ Run: kubectl delete ns staging",
+        "┃  1 (●) Yes, proceed",
+        "┃  2 (○) No, reject",
+        "  1/3:select │ Ctrl+o:yolo │ Ctrl+c:cancel"
+      ]
+    },
+    {
+      "agent": "grok",
+      "state": "idle",
+      "rule": "osc_title_idle",
+      "title": "cornus - grok",
+      "screen": ["❯", "  Ctrl+.:shortcuts"]
+    },
+
+    {
+      "agent": "hermes",
+      "state": "working",
+      "rule": "interrupt_status_working",
+      "title": "hermes",
+      "screen": ["hermes is running the migration", "  ctrl+c to interrupt"]
+    },
+    {
+      "agent": "hermes",
+      "state": "blocked",
+      "rule": "dangerous_command_approval",
+      "title": "hermes",
+      "screen": [
+        "⚠ Dangerous command",
+        "  rm -rf /var/lib/postgresql",
+        "  ▸ 1. Allow once",
+        "    2. Deny",
+        "  ↑/↓ to select · enter confirm"
+      ]
+    },
+    {
+      "agent": "hermes",
+      "state": "idle",
+      "rule": "osc_title_idle",
+      "title": "✓ hermes",
+      "screen": ["hermes › ready", "  3 tasks completed"]
+    },
+
+    {
+      "agent": "kilo",
+      "state": "working",
+      "rule": "esc_interrupt_working",
+      "title": "kilo code",
+      "screen": ["kilo is editing src/store.ts", "  esc interrupt"]
+    },
+    {
+      "agent": "kilo",
+      "state": "blocked",
+      "rule": "opencode_permission",
+      "title": "kilo — permission",
+      "screen": ["△ Permission required", "  Run: docker compose down", "  enter confirm · esc dismiss"]
+    },
+
+    {
+      "agent": "kimi",
+      "state": "working",
+      "rule": "braille_spinner_working",
+      "title": "kimi",
+      "screen": ["⠹ Thinking...", "  reading src/index.ts"]
+    },
+    {
+      "agent": "kimi",
+      "state": "blocked",
+      "rule": "current_approval_panel",
+      "title": "kimi — approve",
+      "screen": [
+        "kimi wants to run this command?",
+        "  npm run deploy",
+        "  ▶ approve   reject   revise",
+        "  ↵ confirm ·  choose"
+      ]
+    },
+
+    {
+      "agent": "kiro",
+      "state": "working",
+      "rule": "kiro_working_marker",
+      "title": "kiro",
+      "screen": ["kiro is working on the migration", "  3 files scanned"]
+    },
+    {
+      "agent": "kiro",
+      "state": "blocked",
+      "rule": "tool_approval",
+      "title": "kiro — approve",
+      "screen": [
+        "Running this tool requires approval:",
+        "  aws s3 rm s3://bucket --recursive",
+        "  y  yes, single permission",
+        "  t  trust, always allow"
+      ]
+    },
+
+    {
+      "agent": "maki",
+      "state": "working",
+      "rule": "status_bar_spinner_working",
+      "title": "maki",
+      "screen": ["Building the deploy plan", "  3 steps queued", " ⠹ [BUILD] 12s · main"]
+    },
+    {
+      "agent": "maki",
+      "state": "blocked",
+      "rule": "permission_prompt",
+      "title": "maki — permission",
+      "screen": ["permission required", "  Run: kubectl apply -f prod.yaml", "  y allow · n deny"]
+    },
+    {
+      "agent": "maki",
+      "state": "idle",
+      "rule": "status_bar_idle",
+      "title": "maki",
+      "screen": ["Ready.", " [BUILD] main · 0 steps"]
+    },
+
+    {
+      "agent": "opencode",
+      "state": "working",
+      "rule": "interrupt_hint_working",
+      "title": "opencode",
+      "screen": ["opencode is editing src/db.ts", "  esc to interrupt"]
+    },
+    {
+      "agent": "opencode",
+      "state": "blocked",
+      "rule": "permission_required",
+      "title": "opencode — permission",
+      "screen": ["△ Permission required", "  Write src/db.ts", "  enter confirm · esc dismiss"]
+    },
+
+    {
+      "agent": "pi",
+      "state": "working",
+      "rule": "working_literal",
+      "title": "pi",
+      "screen": ["pi › refactoring the payment adapter", "Working..."]
+    },
+
+    {
+      "agent": "qodercli",
+      "state": "working",
+      "rule": "cancel_hint_working",
+      "title": "qoder",
+      "screen": ["Qoder is analysing the workspace", "  (esc to cancel, ctrl+c to quit)"]
+    },
+    {
+      "agent": "qodercli",
+      "state": "blocked",
+      "rule": "confirmation_or_input_blocker",
+      "title": "qoder — confirm",
+      "screen": ["Qoder: permission required", "  Run: rm -rf ./node_modules", "  allow / reject"]
+    }
+  ]
+}

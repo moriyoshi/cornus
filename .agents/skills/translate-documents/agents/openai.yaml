@@ -1,0 +1,4 @@
+interface:
+  display_name: "Translate Documents"
+  short_description: "Translate docs while preserving structure and meaning"
+  default_prompt: "Use $translate-documents to translate these documentation pages into the requested locale and validate the result."

@@ -1,0 +1,8 @@
+# A single long-lived, mount-free, port-free service to exec into. Public image
+# so the scenario runs on both the Docker host and kind targets without a build
+# step. `sleep 3600` keeps the container alive for the duration of the exec tests.
+name: e2e-exec
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]

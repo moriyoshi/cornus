@@ -1,0 +1,23 @@
+# Two services of one project behind a SINGLE ingress host, split by path, for the
+# server-side ingress front door E2E. Public images so it runs with no build.
+#
+# The point of the shared host is longest-path routing: `/` must reach web and
+# `/api` must reach api, which only holds if the server's routing table resolves
+# overlapping rules the way a real ingress controller does.
+name: e2e-ing
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: front.example.com
+      path: /
+  api:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:5678", "-text=api-service"]
+    ports:
+      - "5678"
+    x-cornus-ingress:
+      host: front.example.com
+      path: /api

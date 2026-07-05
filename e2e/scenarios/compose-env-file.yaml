@@ -1,0 +1,12 @@
+# Interpolation fixture for compose --env-file / `.env` discovery: every value is
+# a variable with a literal fallback, so an unresolved one is visible as "unset"
+# inside the container rather than as an empty string. Public image, no build.
+name: e2eenv
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    environment:
+      GREETING: ${GREETING:-unset}
+      WHO: ${WHO:-unset}
+      EXTRA: ${EXTRA:-unset}

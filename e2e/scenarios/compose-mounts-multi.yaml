@@ -1,0 +1,36 @@
+# Reproduction of a real-world service whose caretaker got stuck mounting the
+# SECOND and later client-local volumes (the first succeeded).
+#
+# The distinctive shape (vs the single-mount compose-mounts.yaml):
+#   * FOUR client-local bind mounts, not one.
+#   * NESTED targets under a common parent: /app, /app/data, /app/config all live
+#     under /app.
+#   * An anonymous `type: volume` (/app/cache) interspersed BETWEEN the local
+#     binds — it is a server-side volume, not client-local, so it exercises the
+#     mount-name path end to end with a non-bind entry in the mix.
+#   * Mixed read-only / read-write mounts.
+#
+# The cornus image doubles as the app (kept alive with sleep) and the mount-agent
+# sidecar image; every bind source is a committed dir relative to this file,
+# streamed over 9P (never a hostPath).
+name: cmm
+services:
+  init:
+    image: cornus:e2e
+    # cornus:e2e's ENTRYPOINT is `cornus`; override with sleep so the app idles
+    # as a mount target (a bare `command:` would run `cornus sleep`).
+    entrypoint: ["sleep"]
+    command: ["3600"]
+    volumes:
+      - ./compose-mounts-multi-app:/app                       # rw
+      - ./compose-mounts-multi-data:/app/data                 # rw, nested under /app
+      - type: volume
+        target: /app/cache                                    # anon volume (server-side, not client-local)
+      - type: bind
+        source: ./compose-mounts-multi-config
+        target: /app/config                                   # ro, nested under /app
+        read_only: true
+      - type: bind
+        source: ./compose-mounts-multi-extra
+        target: /opt/extra                                    # ro, separate tree
+        read_only: true

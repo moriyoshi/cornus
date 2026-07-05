@@ -1,0 +1,87 @@
+# Six services whose x-cornus-ingress blocks each pin ONE setting the deploy
+# backend has to propagate onto the networking.k8s.io/v1 Ingress, arranged so a
+# real controller's behaviour — not the object's field values — decides the
+# assertion. See ingress-settings-controller.star for what each one proves.
+#
+# traefik/whoami is the backend everywhere because it echoes the request LINE it
+# received ("GET /path HTTP/1.1"), which is what makes the rewrite-target case
+# observable at all; nginx or http-echo would answer 200 to a rewritten and an
+# unrewritten path alike.
+#
+# Every service gets its OWN ingress host. Sharing one host would let a broad
+# rule from a neighbouring service absorb a request that was supposed to miss,
+# turning the negative assertions (404s) into false passes.
+name: e2e-ingset
+services:
+  # 1. Annotations. rewrite-target is the canonical controller-specific knob:
+  #    ingress-nginx rewrites the URI it forwards, so the backend reports a path
+  #    the client never asked for. No annotation propagation => no rewrite.
+  rewrite:
+    image: traefik/whoami:v1.10.1
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: rewrite.settings.example.test
+      path: /app
+      annotations:
+        nginx.ingress.kubernetes.io/rewrite-target: /rewritten
+
+  # 2. pathType. Exact must match /exact and NOTHING below it; the same rule as
+  #    Prefix (the default) would answer /exact/sub too.
+  exact:
+    image: traefik/whoami:v1.10.1
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: exact.settings.example.test
+      path: /exact
+      path_type: Exact
+
+  # 3. Explicit port. The FIRST published port (9999) has nothing listening on
+  #    it; whoami serves 8080. Selecting the first published port — what the
+  #    backend does when Port is unset — therefore 502s, so a 200 here can only
+  #    mean the explicit port reached the Ingress backend.
+  port:
+    image: traefik/whoami:v1.10.1
+    command: ["--port", "8080"]
+    ports:
+      - "9999"
+      - "8080"
+    x-cornus-ingress:
+      host: port.settings.example.test
+      port: 8080
+
+  # 4a. className that the installed controller owns: served.
+  classok:
+    image: traefik/whoami:v1.10.1
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: classok.settings.example.test
+      class_name: nginx
+
+  # 4b. className no IngressClass in the cluster matches: the Ingress is created
+  #     but ingress-nginx ignores it, so the host stays unserved. This is the
+  #     half that proves className is genuinely consulted rather than the object
+  #     being served by whatever controller happens to be running.
+  classbad:
+    image: traefik/whoami:v1.10.1
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: classbad.settings.example.test
+      class_name: cornus-e2e-absent
+
+  # 5. TLS. secret_name must land in spec.tls[].secretName and the host in
+  #    spec.tls[].hosts[], or the controller serves its own self-signed default
+  #    certificate instead of the one in the Secret. The host is dictated by the
+  #    SAN of e2e/scenarios/certs/ingress-byo.crt, which the scenario loads into
+  #    that Secret and then pins as the client's trust root.
+  tlsapp:
+    image: traefik/whoami:v1.10.1
+    ports:
+      - "80"
+    x-cornus-ingress:
+      host: app.native-cert.example.test
+      tls:
+        secret_name: ingset-tls

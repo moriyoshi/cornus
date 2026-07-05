@@ -1,0 +1,11 @@
+# Named-volume fixture for the `down --volumes` E2E: `web` mounts a project-scoped
+# named volume `data`, which the dockerhost backend realizes as the Docker volume
+# `e2evol_data`. Public image so no build is needed.
+name: e2evol
+services:
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - data:/data
+volumes:
+  data:

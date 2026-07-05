@@ -1,0 +1,23 @@
+# Fixture for web.star: a 2-service project with a depends_on edge (web -> cache)
+# and a named volume, so the web UI BFF has a dependency graph and a mount to
+# report. Public images, so it runs on every target without a build. A named
+# volume (not a bind) keeps it portable across docker/containerd/kube.
+name: webe2e
+services:
+  cache:
+    image: redis:7-alpine
+    # Shell-discovery fixture: both images are alpine, so both have /bin/ash AND
+    # /bin/sh, and the default preference order picks ash. Declaring sh here makes
+    # this service answer differently from `web` — which is what proves the
+    # service's own list outranks the caller's, rather than the two agreeing by
+    # accident. It changes nothing about the deployment: the list lives on the
+    # compose PLAN, never in the deploy spec.
+    x-cornus-shells:
+      - /bin/sh
+    volumes:
+      - cachedata:/data
+  web:
+    image: nginx:1.27-alpine
+    depends_on: [cache]
+volumes:
+  cachedata: {}

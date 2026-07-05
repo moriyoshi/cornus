@@ -1,0 +1,14 @@
+# A workload on a USER-DEFINED network, for server-in-container.star.
+#
+# The network is the entire point. Docker drops traffic between two different
+# bridge networks, so a cornus server that is itself a container on the default
+# bridge has no route to anything here — the topology the server-in-container
+# scenario's network section exists to prove cornus repairs by attaching its own
+# container to `inctrnet` at deploy time.
+name: inctrnet
+services:
+  web:
+    image: nginx:1.27-alpine
+    networks: [appnet]
+networks:
+  appnet: {}

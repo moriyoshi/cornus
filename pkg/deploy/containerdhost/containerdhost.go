@@ -1,0 +1,250 @@
+// Package containerdhost implements cornus's deploy.Backend natively against a
+// containerd daemon — no dockerd required. It speaks the containerd v1 client
+// API in a dedicated namespace, realizes networking with CNI bridge + portmap
+// plugins (each instance gets its own netns and IP; host ports publish via
+// portmap; service names and network aliases resolve between instances through
+// a synced, bind-mounted /etc/hosts — see hosts_linux.go), persists logs
+// through a `cornus containerd-log-shim` binary log URI
+// so they survive cornus restarts, and delegates restart policy to containerd's
+// restart-monitor plugin via containerd.io/restart labels.
+//
+// Linux-only: the implementation lives behind //go:build linux, and New returns
+// ErrUnsupported elsewhere (mirroring pkg/build/builder).
+package containerdhost
+
+import (
+	"fmt"
+	"os"
+
+	"cornus/pkg/deploy"
+	"cornus/pkg/deploy/hostpolicy"
+	"cornus/pkg/deploy/internal/hostrun"
+	"cornus/pkg/hostenv"
+	"cornus/pkg/remotecompanion"
+)
+
+// Config configures the backend. Empty fields resolve from the environment.
+type Config struct {
+	// DataDir is cornus's data directory; the backend keeps volumes, logs, and
+	// CNI state under <DataDir>/containerd/.
+	DataDir string
+	// Address is the containerd socket. Empty resolves CORNUS_CONTAINERD_ADDRESS,
+	// then the standard CONTAINERD_ADDRESS, then /run/containerd/containerd.sock.
+	Address string
+	// Namespace is the containerd namespace cornus manages. Empty resolves
+	// CORNUS_CONTAINERD_NAMESPACE, default "cornus". The build engine's
+	// containerd worker defaults to the same namespace so built images are
+	// directly runnable without a registry round-trip.
+	Namespace string
+	// Snapshotter names the containerd snapshotter used for image unpack and
+	// container rootfs snapshots. Empty resolves CORNUS_CONTAINERD_SNAPSHOTTER,
+	// then containerd's compile-time default (overlayfs on linux). Set it to
+	// "native" when the containerd root itself sits on an overlay filesystem
+	// (docker-in-docker, nested containers): the kernel rejects overlay-upon-
+	// overlay mounts, which surfaces as "failed to mount rootfs component:
+	// invalid argument" at task start.
+	Snapshotter string
+	// Mapper translates the paths this backend hands containerd into the
+	// spelling containerd resolves them at. Every one of them — volume
+	// backings, the managed /etc/hosts, the log file, the log-shim binary — is
+	// opened by containerd (or by a shim it spawns) in the HOST's mount
+	// namespace, so a cornus containerized away from it must translate or the
+	// workload silently comes up against empty directories.
+	//
+	// nil means the identity: cornus and containerd see the same filesystem,
+	// which is every non-containerized deployment.
+	Mapper hostenv.Mapper
+}
+
+// DefaultAddress is the stock containerd socket path.
+const DefaultAddress = "/run/containerd/containerd.sock"
+
+// DefaultNamespace is the containerd namespace cornus uses when none is set.
+const DefaultNamespace = "cornus"
+
+// NetnsDir is where this backend pins an instance's network namespace, re-exported
+// for the startup preflight (pkg/hostcheck cannot import the internal hostrun
+// package that owns it). A containerized server hands this path to containerd, so
+// the preflight has to know whether the runtime can resolve it — see
+// hostcheck.CheckNetns. The agreement with hostrun.NetnsDir is the contract, and
+// is pinned by a test: two constants that must be equal are individually
+// defensible when they drift, and nothing else would notice.
+const NetnsDir = hostrun.NetnsDir
+
+// ResolveAddress reports the containerd socket a Config's Address resolves to.
+//
+// Exported because self-inspection (SelfInspector) has to reach the SAME daemon
+// the deploy path will, and it runs before any Backend exists — a startup
+// preflight, not a backend method. Two separate copies of this precedence would
+// let the preflight confirm a container on one daemon while deploys go to
+// another, which is worse than no self-inspection at all: the path map would be
+// confidently derived from a container the deploying daemon has never heard of.
+func ResolveAddress(addr string) string {
+	if addr == "" {
+		addr = os.Getenv("CORNUS_CONTAINERD_ADDRESS")
+	}
+	if addr == "" {
+		addr = os.Getenv("CONTAINERD_ADDRESS")
+	}
+	if addr == "" {
+		addr = DefaultAddress
+	}
+	return addr
+}
+
+// ResolveNamespace reports the containerd namespace a Config's Namespace
+// resolves to. Exported for the same reason as ResolveAddress.
+func ResolveNamespace(ns string) string {
+	if ns == "" {
+		ns = os.Getenv("CORNUS_CONTAINERD_NAMESPACE")
+	}
+	if ns == "" {
+		ns = DefaultNamespace
+	}
+	return ns
+}
+
+// resolve fills empty Config fields from the environment and defaults.
+func (c Config) resolve() (Config, error) {
+	c.Address = ResolveAddress(c.Address)
+	c.Namespace = ResolveNamespace(c.Namespace)
+	if c.Snapshotter == "" {
+		c.Snapshotter = os.Getenv("CORNUS_CONTAINERD_SNAPSHOTTER")
+	}
+	if c.DataDir == "" {
+		return Config{}, fmt.Errorf("containerd: Config.DataDir is required")
+	}
+	if c.Mapper == nil {
+		c.Mapper = hostenv.Identity()
+	}
+	return c, nil
+}
+
+// Option configures the backend.
+type Option func(*options)
+
+type options struct {
+	policy     hostpolicy.Policy
+	remote     bool
+	agentImage string
+	companions *remotecompanion.Registry
+	selfID     string
+	creds      deploy.RegistryCredentials
+}
+
+// WithSelfContainerID pins the containerd container id this cornus process runs
+// as, so the destructive paths refuse to stop or remove it (see self_linux.go).
+// Without it the backend infers its own identity from /proc/self/cgroup, which
+// works for the default containerd cgroup layout and is inert otherwise.
+//
+// An empty id is ignored rather than recorded as "known not to be
+// containerized": "" is also what a failed inference yields, and pinning it
+// would silently disarm the guard.
+func WithSelfContainerID(id string) Option {
+	return func(o *options) { o.selfID = id }
+}
+
+// WithPolicy sets the host-privilege policy enforced at Apply time. Without it,
+// the zero policy applies: default-deny (no privileged containers, no host binds).
+func WithPolicy(p hostpolicy.Policy) Option {
+	return func(o *options) { o.policy = p }
+}
+
+// LogShimArg is the binary-log-URI query key carrying the log file path, and by
+// construction also the name of the cornus subcommand containerd execs.
+//
+// containerd's process.NewBinaryCmd turns each query param of a
+// `binary:///path/to/cornus?KEY=VALUE` log URI into an argv pair "KEY VALUE", so
+// the key IS the subcommand name and the value its positional argument:
+// `cornus containerd-log-shim <path>`. That top-level spelling is a hidden alias
+// of the canonical `cornus daemon containerd-log-shim` (both registered in
+// cmd/cornus); the URI must target the alias because NewBinaryCmd cannot address
+// a nested `daemon` subcommand. A single key is deliberate: NewBinaryCmd iterates
+// the query map and takes only each key's first value, so multiple keys would
+// produce a nondeterministic argv order and extra values would be dropped.
+//
+// It lives HERE, in the one file of this package with no //go:build linux tag,
+// specifically so cmd/cornus can name its command from this constant rather than
+// repeating the literal. It previously sat in logs_linux.go, unreachable off
+// Linux, and the guard in cmd/cornus therefore compared its kong tag against a
+// THIRD copy declared in the test itself — so changing the value here left that
+// test green while containerd went on to exec a subcommand that does not exist.
+// The shim dies, the workload keeps running, and `cornus logs` returns empty for
+// a healthy container, which reads as "the workload printed nothing" — the least
+// likely explanation anyone doubts.
+const LogShimArg = "containerd-log-shim"
+
+// WithRemote opts this Backend into the caretaker-sidecar mount-relay path
+// (ApplyWithMounts, mounts_linux.go). Unlike dockerhost, this does NOT make
+// containerd itself reachable from a different host — its client dialer is
+// hard-coded to a local unix socket — so what it changes is how client-local
+// mounts are realized on an otherwise still-co-located daemon (e.g. to avoid the
+// server needing a privileged kernel mount of its own). See
+// CORNUS_CONTAINERD_REMOTE.
+//
+// It is not a choice BETWEEN two working mechanisms, the way dockerhost's is.
+// pkg/server's co-located kernel-9P path (applyWithHostMounts) is dockerhost and
+// bare only — see hostcheck.UsesHostMountFastPath, the single source for that
+// classification — so with this off, client-local mounts on containerd are
+// unavailable, and the server's rejection names this option's environment
+// variable instead of reporting the backend as incapable.
+func WithRemote(remote bool) Option {
+	return func(o *options) { o.remote = remote }
+}
+
+// WithAgentImage sets the cornus-embedding image (CORNUS_AGENT_IMAGE) used for
+// the always-on remote-companion sidecar in remote mode (see
+// mounts_linux.go). Consulted only when WithRemote(true) is also set;
+// ApplyWithMounts/ApplyWithEgress take their own AgentImage per call instead
+// (unaffected).
+func WithAgentImage(image string) Option {
+	return func(o *options) { o.agentImage = image }
+}
+
+// WithRegistryCredentials installs the per-pull registry credential resolver.
+func WithRegistryCredentials(creds deploy.RegistryCredentials) Option {
+	return func(o *options) { o.creds = creds }
+}
+
+// WithCompanionRegistry sets the server's per-instance companion-connection
+// registry (pkg/remotecompanion), so ForwardPort can look up a remote-mode
+// instance's companion connection instead of dialing it directly. Required
+// for WithRemote(true) to make ForwardPort/cornus tunnel/cornus port-forward
+// work; nil (the zero value) makes ForwardPort always error in remote mode.
+func WithCompanionRegistry(r *remotecompanion.Registry) Option {
+	return func(o *options) { o.companions = r }
+}
+
+// instanceName names replica i of a deployment, mirroring the dockerhost
+// convention. It is also the containerd container ID.
+func instanceName(app string, i int) string { return fmt.Sprintf("cornus-%s-%d", app, i) }
+
+// Labels recorded on every managed container, beyond deploy.LabelManaged and
+// deploy.LabelApp.
+const (
+	// labelNetworks records the instance's user-defined network memberships
+	// (comma-joined) so Delete can garbage-collect networks whose last member
+	// is gone without inspecting every container.
+	labelNetworks = "cornus.networks"
+	// labelIP records the instance's primary CNI-assigned IP for Status and
+	// ForwardPort.
+	labelIP = "cornus.ip"
+	// labelNetNS records the instance's named-netns bind-mount path so
+	// Start/Delete can find it across cornus restarts.
+	labelNetNS = "cornus.netns"
+	// labelPorts records the instance's published port mappings as JSON so CNI
+	// teardown can release the portmap rules without the original spec.
+	labelPorts = "cornus.ports"
+	// labelNetIPs records the instance's per-network CNI-assigned IPs as JSON
+	// (network -> IP) so the hosts-file sync can publish the right address on
+	// each shared network.
+	labelNetIPs = "cornus.netips"
+
+	// labelHealthcheck carries the workload's api.Healthcheck as JSON, so the
+	// probe engine can re-arm after a SERVER restart. See healthcheckFromLabels.
+	labelHealthcheck = "cornus.healthcheck"
+	// labelAliases records the spec's per-network aliases as JSON (network ->
+	// aliases) so the hosts-file sync can rebuild the name map without the
+	// original spec.
+	labelAliases = "cornus.aliases"
+)

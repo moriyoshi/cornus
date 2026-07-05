@@ -1,0 +1,603 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede an in-flight run for the same ref (PR branch or main push) so rapid
+  # successive pushes don't pile up parallel, redundant CI runs.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Standard gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go build (cloudblob storage drivers)
+        # The gs:// / azblob:// gocloud drivers are behind the `cloudblob` build tag
+        # (they pull the Google/Azure SDKs). Compile that path so it does not rot,
+        # without pulling the drivers into the default binary.
+        run: go build -tags cloudblob ./pkg/storage/...
+
+      - name: go build (E2E FTP server fixture)
+        # The ftp*.star scenarios build this Go FTP server (fclairamb/ftpserverlib).
+        # It is a nested module (kept out of the main go.mod), so compile it
+        # explicitly here so it does not rot.
+        run: cd e2e/scenarios/ftp && go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build + test (otelcol embedded collector)
+        # The workload OpenTelemetry Collector is behind the `otelcol` build tag (it
+        # pulls the collector-core dependency tree); the default gate above only
+        # compiles the stub. Build + test the real collector path so it does not rot
+        # and the released image (which ships with the tag) stays green.
+        run: make test-otel
+
+      - name: E2E scenario syntax check
+        run: make e2e-check
+
+  # The built-in observability store (pkg/obsstore) is IMBH, a Rust database
+  # reached over cgo, so unlike every other optional feature it cannot ride the
+  # standard gate at all: that gate is CGO_ENABLED=0 and compiles only the stub.
+  #
+  # This job is BLOCKING. It was advisory (continue-on-error) while upstream
+  # imbh-go v0.1.1 had only ever been exercised on linux/arm64 and these runners
+  # are amd64: a failure then meant "the prebuilt amd64 archive is not ready", not
+  # "this PR broke something". That gate is closed — the amd64 run went green on
+  # 2026-07-26 — and the store now ships in EVERY artifact: the Dockerfile's
+  # default BUILD_TAGS and all five released binaries link it in, and `--obs`
+  # defaults to on wherever it is linked. A broken store is therefore a broken
+  # release, so it has to break the build here first.
+  obsstore:
+    name: Observability store (imbh)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build + test (imbh observability store)
+        # Fetches the prebuilt libimbhgo.a for this platform (no Rust toolchain
+        # needed), then builds and race-tests the real store path.
+        run: make test-imbh
+
+  # Validates the in-repo yamux QoS fork and its performance/emulation harnesses,
+  # none of which the standard gate exercises: the fork is a nested module (go.mod's
+  # `replace` target) whose own tests the main `go test ./...` never runs, and the
+  # qosab / netemab harnesses are benchmarks + a nested gVisor module. Runs in
+  # parallel with `gate` so its (heavier) netem step never slows the critical gate.
+  qos:
+    name: QoS transport (yamux fork + netem)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          # Key the module + build cache on every module's go.sum so the netem
+          # step's one-time gVisor compile is reused across runs and re-runs only
+          # when a pin changes. third_party/yamux has no deps (empty go.sum).
+          cache-dependency-path: |
+            go.sum
+            third_party/yamux/go.sum
+            pkg/wire/qosab/netemab/go.sum
+            pkg/wire/sqliteab/go.sum
+
+      - name: yamux fork unit tests (race; QoS priority/frame-cap + upstream suite)
+        # The fork is a nested module, so the main `go test ./...` never runs its
+        # own tests. Run them here: the QoS additions (SetPriority/SetMaxWindow
+        # clamps + scheduler) plus the full upstream yamux suite, so a fork change
+        # that breaks either the new behavior or core yamux fails CI. `-race`
+        # matches upstream yamux's own CI and guards the scheduler concurrency the
+        # fork introduced (sendLoop / class-aware send path).
+        #
+        # `-short` here is deliberate: the multi-GiB throughput tests
+        # (TestSendData_Large / _VeryLarge) self-skip under -short because they
+        # "may time out on the race detector" — under `-race` on a contended CI
+        # runner they exceed their internal 120s deadline. The scheduler
+        # concurrency the race detector is here to guard is still fully exercised
+        # by the rest of the suite; the big transfers get their own non-race pass
+        # below.
+        run: cd third_party/yamux && go test -race -short ./...
+
+      - name: yamux fork throughput/integrity (no race; full transfer sizes)
+        # Companion to the -race -short pass above: run the whole suite WITHOUT the
+        # race detector so the multi-GiB throughput/integrity tests that -short
+        # skips (TestSendData_Large, full-size batched integrity) actually execute.
+        # Without -race these finish in seconds instead of timing out, so the fork's
+        # bulk send path stays covered.
+        #
+        # TestSendData_VeryLarge (1 GiB x 16 workers) is -skip'd here: on shared
+        # GitHub-hosted runners it contends with the concurrent image build and CLI
+        # matrix, starving the transfer goroutines until yamux's keepalive/write
+        # safety-valve trips ("keepalive failed: i/o deadline reached") — a runner
+        # timing flake, not a fork regression. It still runs locally (plain
+        # `go test ./...` in third_party/yamux), and TestSendData_Large keeps the
+        # bulk path covered in CI.
+        run: cd third_party/yamux && go test -skip '^TestSendData_VeryLarge$' ./...
+
+      - name: qosab in-process QoS harness smoke (run each benchmark once)
+        # qosab lives in the main module (so the gate compile-checks it), but its
+        # benchmarks never execute there. `-benchtime 1x` runs each once over the
+        # in-process link simulator to catch runtime panics/deadlocks in the
+        # scheduler + link across the full variant x profile matrix, cheaply.
+        run: go test -run '^$' -bench . -benchtime 1x ./pkg/wire/qosab/
+
+      - name: netemab tests (yamux QoS over a real TCP stack on emulated L3 links)
+        # Nested module so ooni/netem's heavy gVisor userspace-netstack dependency
+        # stays out of the main go.mod. The matrix tests are measurement-driven, so
+        # they guard against compile/API breaks vs gVisor/netem and against the fork
+        # failing to establish sessions over real TCP (delay/loss/bandwidth/MTU).
+        # First run compiles gVisor (cached by setup-go on later runs).
+        run: cd pkg/wire/qosab/netemab && go test -timeout 10m ./...
+
+      - name: sqliteab tests (real SQLite over the block-protocol transport)
+        # Nested module (cgo mattn/go-sqlite3 + a psanford/sqlite3vfs VFS) so its
+        # heavy SQLite amalgamation stays out of the main go.mod. Runs a real
+        # SQLite workload over ServeBlockProxy/ServeBlockServer on the yamux fork
+        # (both send paths): the TestSQLite correctness cases prove the block
+        # proxy is coherent under a database's page-write/fsync pattern (integrity
+        # ok in-mount AND on the authoritative on-disk file), and a one-shot bench
+        # smoke catches runtime panics in the insert workload cheaply.
+        run: cd pkg/wire/sqliteab && go test -run TestSQLite -bench . -benchtime 1x -timeout 10m ./...
+
+  # Executes the opt-in, emulator/mock-backed storage and credential backends that
+  # the standard gate only COMPILE-checks: registry storage over S3 / GCS / Azure
+  # and the aws-sts credential source. All four run in ONE tagged `go test`
+  # (`credaws` + `cloudblob` compose) against three local emulators — winterbaume
+  # (one binary serving both S3 and STS), fake-gcs-server, and Azurite — so no
+  # cloud account or network egress to AWS/GCP/Azure is needed. The same tests
+  # self-skip in the standard gate (no endpoints set); here the endpoints are
+  # provisioned, so they execute. See .agents/docs/TESTING.md.
+  integration-backends:
+    name: Integration backends (S3 / STS / GCS / Azure emulators)
+    runs-on: ubuntu-24.04
+    env:
+      # Pinned winterbaume release + checksum (>= v0.2.5 required for S3 gzip
+      # layers; see .agents/docs/LTM/registry-and-storage.md). x86_64 runner.
+      WB_VERSION: v0.2.5
+      WB_ASSET: winterbaume-server-x86_64-unknown-linux-gnu.tar.xz
+      WB_SHA256: adb0334950d5c067eff0ba75918fca81f1a0dca70394dfd82ba05ad588467fec
+      WB_DIR: winterbaume-server-x86_64-unknown-linux-gnu
+      # Emulator images pinned by manifest-list (index) digest — reproducible and
+      # the stable key for the image cache below. Multi-arch, so the same digest
+      # resolves on the x86_64 runner.
+      GCS_IMAGE: fsouza/fake-gcs-server@sha256:3730da0e31f7e5186a90ec4899dc2c336104e7599df400411392ef17e684c31f
+      AZ_IMAGE: mcr.microsoft.com/azure-storage/azurite@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Cache the pinned winterbaume binary (keyed on the release version) and the
+      # pinned emulator images (keyed on their digests), so a run re-downloads /
+      # re-pulls only when a pin changes.
+      - name: Cache winterbaume binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.WB_DIR }}
+          key: winterbaume-${{ env.WB_VERSION }}-linux-x86_64
+
+      - name: Cache emulator images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: emu-images.tar
+          key: emulator-images-${{ env.GCS_IMAGE }}-${{ env.AZ_IMAGE }}
+
+      - name: Start emulators (winterbaume S3+STS, fake-gcs-server, Azurite)
+        run: |
+          set -euo pipefail
+
+          # AWS S3 + STS: one winterbaume binary serves both. Download + verify only
+          # on a cache miss; otherwise the cached binary is already present.
+          if [ ! -x "$WB_DIR/winterbaume-server" ]; then
+            curl -fsSL -o "$WB_ASSET" \
+              "https://github.com/moriyoshi/winterbaume/releases/download/winterbaume-server-${WB_VERSION}/${WB_ASSET}"
+            echo "${WB_SHA256}  ${WB_ASSET}" | sha256sum -c -
+            tar xf "$WB_ASSET"
+          fi
+          nohup "./$WB_DIR/winterbaume-server" --host 127.0.0.1 --port 5555 > winterbaume.log 2>&1 &
+          disown
+
+          # Emulator images: docker load from the cached tarball on a hit, else pull
+          # the pinned digests and save the tarball for the cache to persist. Both
+          # paths leave the images under fixed local tags used by docker run below.
+          if [ -f emu-images.tar ]; then
+            docker load -i emu-images.tar
+          else
+            docker pull "$GCS_IMAGE"
+            docker pull "$AZ_IMAGE"
+            docker tag "$GCS_IMAGE" gcs-emul:pinned
+            docker tag "$AZ_IMAGE" az-emul:pinned
+            docker save gcs-emul:pinned az-emul:pinned -o emu-images.tar
+          fi
+
+          # GCS via fake-gcs-server.
+          docker run -d --name gcs-emul -p 127.0.0.1:4443:4443 gcs-emul:pinned \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443
+
+          # Azure Blob via Azurite (--skipApiVersionCheck required by the SDK).
+          docker run -d --name az-emul -p 127.0.0.1:10000:10000 az-emul:pinned \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+
+          # Wait for all three to accept connections (curl w/o -f: any HTTP reply = up).
+          wait_up() { for _ in $(seq 1 100); do curl -s -o /dev/null "$1" && return 0; sleep 0.3; done; echo "timeout: $1" >&2; return 1; }
+          wait_up "http://127.0.0.1:5555/"
+          wait_up "http://127.0.0.1:4443/storage/v1/b?project=test"
+          wait_up "http://127.0.0.1:10000/devstoreaccount1"
+
+          # Pre-create the GCS bucket and Azure container (S3 self-creates its bucket).
+          curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
+            -H 'Content-Type: application/json' -d '{"name":"test-bucket"}' -o /dev/null
+          # devstoreaccount1 is Azurite's PUBLIC well-known dev credential (commit-safe).
+          az storage container create --name test-container \
+            --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+
+      - name: go test (S3 / STS / GCS / Azure over emulators)
+        env:
+          # AWS S3 + STS (winterbaume) with static test credentials.
+          CORNUS_TEST_S3_ENDPOINT: http://127.0.0.1:5555
+          CORNUS_TEST_STS_ENDPOINT: http://127.0.0.1:5555
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          # GCS (fake-gcs-server).
+          STORAGE_EMULATOR_HOST: 127.0.0.1:4443
+          CORNUS_TEST_GCS: gs://test-bucket
+          # Azure Blob (Azurite).
+          AZURE_STORAGE_ACCOUNT: devstoreaccount1
+          AZURE_STORAGE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+          AZURE_STORAGE_DOMAIN: 127.0.0.1:10000
+          AZURE_STORAGE_PROTOCOL: http
+          AZURE_STORAGE_IS_LOCAL_EMULATOR: "true"
+          CORNUS_TEST_AZBLOB: azblob://test-container
+        run: go test -tags "credaws cloudblob" -run 'S3|STS|GCS|Azblob' ./pkg/storage/ ./pkg/credential/awssts/
+
+  helm:
+    name: Helm chart lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: helm lint
+        run: helm lint deploy/helm/cornus
+
+      - name: helm template (default + TLS/cert-manager)
+        run: |
+          # Render both the default (TLS off) and the opt-in cert-manager path so a
+          # template regression fails CI even without a cluster.
+          helm template deploy/helm/cornus >/dev/null
+          helm template deploy/helm/cornus \
+            --set tls.enabled=true \
+            --set tls.clientCA=true \
+            --set tls.certManager.enabled=true \
+            --set tls.certManager.issuerRef.name=ci-issuer >/dev/null
+
+  # The SolidJS SPA in web/ is EMBEDDED into every released binary (pkg/webui
+  # //go:embed dist) and into the image, but nothing in the Go gate compiles or
+  # runs it: `go test ./...` only ever sees the built dist/ (or the "run make web"
+  # placeholder). release.yml's webui job builds it, on tags only, and never runs
+  # its tests — so before this job a type error or a broken component landed on
+  # main unnoticed and surfaced at release time. Same two commands a developer
+  # runs: `npm run build` is `tsc --noEmit && vite build` (type-check AND bundle),
+  # `npm test` is `vitest run`.
+  web:
+    name: Web UI (type-check, build, unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        # Same pinned action + node major as release.yml's webui job, so what CI
+        # type-checks is what the release actually bundles. The npm cache is keyed
+        # on web/package-lock.json (the lockfile `npm ci` installs from).
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+
+      - name: npm run build (tsc --noEmit + vite build)
+        working-directory: web
+        run: npm run build
+
+      - name: npm test (vitest)
+        working-directory: web
+        run: npm test
+
+  # The ROOT Dockerfile — the production image — used to first build in
+  # release.yml's `image` job, which is tag-only, so a Dockerfile regression was
+  # discovered while cutting a release. (e2e.yml builds only e2e/container/Dockerfile,
+  # a different file with a different base and stages.) Build it here on every PR.
+  #
+  # Deliberately amd64-only and push-less: the release job's arm64 leg cross-builds
+  # a ~600 MB cgo/Rust archive under QEMU, which is far too slow for a PR gate, and
+  # a single native platform catches essentially every Dockerfile-shaped break
+  # (stage ordering, COPY paths, the npm/go/imbh/go-licenses steps, the final
+  # runtime image). GHA layer caching matches release.yml's idiom.
+  image:
+    name: Image build + smoke (linux/amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image (amd64, load into the local daemon)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          # load: true puts the built image in the runner's docker daemon so the
+          # smoke steps below can actually run it — without it buildx keeps the
+          # result in its own cache and `docker run` finds nothing.
+          load: true
+          tags: cornus:ci
+          # Separate cache scope from release.yml's multi-arch export so the two
+          # workflows never overwrite each other's layers.
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,mode=max,scope=ci-image
+
+      - name: Smoke - cornus version
+        # ENTRYPOINT is `cornus`, so this replaces the default `serve` CMD. Also
+        # asserts the feature report, which is what proves the cgo `imbh` store
+        # actually linked (the Dockerfile's own build-stage assertion covers the
+        # build stage; this covers the final runtime image).
+        run: |
+          set -euo pipefail
+          docker run --rm cornus:ci version
+          docker run --rm cornus:ci version --features --output json | tee features.json
+          grep -q '"obsstore":"yes"' features.json
+
+      - name: Smoke - serve + /healthz
+        # Boots the image exactly as the default CMD does (`serve --addr :5000`)
+        # and probes the liveness endpoint, so an image that builds but cannot
+        # start (missing runtime package, bad ENTRYPOINT, unwritable CORNUS_DATA)
+        # fails the PR instead of the release.
+        run: |
+          set -euo pipefail
+          docker run -d --name cornus-smoke -p 127.0.0.1:5000:5000 cornus:ci
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5000/healthz >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::cornus:ci did not answer /healthz within 60s" >&2
+            docker logs cornus-smoke || true
+            docker rm -f cornus-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "/healthz OK"
+          docker rm -f cornus-smoke >/dev/null
+
+  # THIRD_PARTY_NOTICES.md (repo root, ~566 KB) is a GENERATED file: the
+  # `audit-licenses` skill produces it from the modules `go list -deps ./cmd/...`
+  # reports for the SHIPPED build configuration on every RELEASED platform (unioned),
+  # plus the npm packages bundled into the embedded SPA. release.yml attaches it to every GitHub release as the notice
+  # text that has to accompany the statically-linked binaries (Apache-2.0 §4d, the
+  # BSD/MIT/ISC copyright lines, the MPL-2.0 notice).
+  #
+  # Nothing regenerated or verified it, so a dependency bump could silently make the
+  # SHIPPED notices wrong — precisely the failure the file exists to prevent. This
+  # job closes that with two checks:
+  #
+  #   1. POLICY  — scan_licenses.py exits non-zero on any strong-copyleft
+  #      (GPL/LGPL/AGPL) or unclassifiable ("review") dependency. Weak-copyleft
+  #      (MPL-2.0 — six HashiCorp libraries plus the vendored yamux fork) is allowed
+  #      by policy and is only surfaced as a warning, per the advisory step below.
+  #   2. DRIFT   — regenerate the notices and require BYTE-IDENTITY with the
+  #      committed file, so a dependency change that alters licensing must update it
+  #      in the same PR.
+  #
+  # No path filter on go.mod/go.sum/package-lock.json: the shipped set also moves
+  # when a build tag or an import changes, not only when a lockfile does, and a
+  # scoped trigger would miss exactly those cases. It does not need one — the scan
+  # is ~1 min warm (it only reads module metadata and LICENSE files) and runs in a
+  # parallel job, so the critical `gate` path is unaffected.
+  #
+  # NOTE: go-licenses is deliberately NOT used here. That tool builds the separate
+  # /usr/share/doc/cornus/third-party-licenses BUNDLE in the Dockerfile/Makefile
+  # (already compile-exercised by the `image` job above), and it needs CGO plus a
+  # libc-matched libimbhgo.a to resolve the `imbh` tag — not hermetic enough for a
+  # PR gate. The notices FILE is produced by the skill's own scanner, which only
+  # reads the module cache that setup-go already caches.
+  licenses:
+    name: Third-party licenses (policy + notices drift)
+    runs-on: ubuntu-24.04
+    env:
+      # `go list -deps` is PLATFORM-SENSITIVE: which modules a build links depends
+      # on GOOS/GOARCH. Both checks below therefore scan the UNION of every
+      # platform release.yml ships (its binaries matrix), not one representative
+      # architecture — scan_licenses.py --platforms unions the module sets.
+      #
+      # This closes a real gap rather than a theoretical one. While the notices
+      # were the linux/arm64 view they omitted 13 shipped modules: klauspost/cpuid
+      # and tonistiigi/go-archvariant (linux/amd64 only) plus 11 reachable only on
+      # darwin/windows. One of those 11, mattn/go-localereader, ships NO license
+      # file and so had never passed the POLICY gate either, because that gate ran
+      # on linux only. Cross-compiling `go list` needs no matching runner — it is
+      # pure module resolution — so the union costs one ubuntu job.
+      RELEASE_PLATFORMS: linux/amd64,linux/arm64,darwin/amd64,darwin/arm64,windows/amd64
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        # The npm half of the inventory reads each bundled package's license out of
+        # web/node_modules, so the SPA's dependencies must actually be installed —
+        # same pinned action, node major and cache key as the `web` job above.
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+
+      - name: Resolve the shipped build tags (single source of truth = Makefile)
+        # LICENSE_TAGS in the Makefile is the list that `make third-party-licenses`,
+        # the Dockerfile's BUILD_TAGS and .github/scripts/build-release-binary.sh all
+        # agree on. Reading it here rather than restating it means a future tag change
+        # cannot leave this job scanning a different binary than the one we ship —
+        # that would otherwise surface only as an unexplained drift diff. The tag set
+        # is load-bearing: without `otelcol` the entire collector tree disappears from
+        # the inventory, and without `imbh`/`sable_extern_lib` the store's bindings
+        # resolve to stubs so imbh-go and sable never appear at all.
+        run: |
+          set -euo pipefail
+          tags="$(sed -n 's/^LICENSE_TAGS ?= *//p' Makefile)"
+          if [ -z "$tags" ]; then
+            echo "::error::could not read LICENSE_TAGS from the Makefile — the scan would cover the wrong build configuration" >&2
+            exit 1
+          fi
+          echo "shipped build tags: ${tags}"
+          echo "GOFLAGS=-tags=${tags}" >> "$GITHUB_ENV"
+
+      - name: Resolve the shipped Go dependency set
+        # A standalone probe, because scan_licenses.py only WARNS to stderr when
+        # `go list` fails and then reports an empty inventory: without this, a
+        # module-download or build-tag failure would show up as a 350-module drift
+        # diff blaming the notices file instead of as a legible red step here.
+        run: |
+          set -euo pipefail
+          echo "$RELEASE_PLATFORMS" | tr ',' '\n' | while read -r p; do
+            [ -n "$p" ] || continue
+            n="$(GOOS="${p%/*}" GOARCH="${p#*/}" go list -deps -f '{{with .Module}}{{.Path}}{{end}}' ./cmd/... | grep -c . || true)"
+            echo "${p}: ${n} shipped modules"
+            if [ "$n" -lt 100 ]; then
+              echo "::error::${p} resolved only ${n} modules — the license scan would be meaningless" >&2
+              exit 1
+            fi
+          done
+
+      - name: License policy scan (fails on strong-copyleft or unclassifiable)
+        run: |
+          set -euo pipefail
+          mkdir -p .agents-workspace/tmp
+          python3 .agents/skills/audit-licenses/scripts/scan_licenses.py \
+            --repo . --platforms "$RELEASE_PLATFORMS" \
+            --json .agents-workspace/tmp/inventory-policy.json | tee scan-policy.txt
+          # scan_licenses.py prints "NOT INSTALLED" for a runtime (bundled) npm dep it
+          # could not find under web/node_modules. Such a package would silently drop
+          # out of the notices instead of failing, so treat it as an error: npm ci ran
+          # above, so it can only mean the install did not take.
+          if grep -q 'NOT INSTALLED' scan-policy.txt; then
+            echo "::error::a bundled npm dependency is missing from web/node_modules — the notices would under-report the SPA" >&2
+            exit 1
+          fi
+
+      - name: Flag non-permissive dependencies (advisory, never fails)
+        # Weak-copyleft is ALLOWED by policy (references/policy.md): MPL-2.0 is
+        # file-level reciprocal and compatible with shipping a static Apache-2.0
+        # binary as long as the notices carry it, which they do. So this only
+        # SURFACES the set — one annotation per dependency — to keep it visible in
+        # review and make an unexpected addition obvious. The scan step above is the
+        # one that fails, and only on strong-copyleft or an unclassifiable license.
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          f=.agents-workspace/tmp/inventory-policy.json
+          [ -f "$f" ] || { echo "no inventory (the scan step did not get that far)"; exit 0; }
+          python3 - "$f" <<'PY'
+          import json, sys
+          inv = json.load(open(sys.argv[1]))
+          rows = (inv.get("go", []) + inv.get("npm", [])
+                  + [{**v, "module": v["path"]} for v in inv.get("vendored", [])])
+          flagged = [r for r in rows if r.get("category") != "permissive"]
+          for r in sorted(flagged, key=lambda r: (r["category"], r["module"])):
+              print(f"::warning title=Non-permissive dependency::{r['module']} "
+                    f"{r.get('version','')} is {r['license']} ({r['category']})")
+          print(f"{len(flagged)} non-permissive of {len(rows)} shipped dependencies")
+          PY
+
+      - name: Regenerate THIRD_PARTY_NOTICES.md and require byte-identity
+        run: |
+          set -euo pipefail
+          # `|| true`: the scanner exits non-zero on a policy blocker, which the
+          # dedicated step above already reports. Here we only want its inventory —
+          # the empty-inventory failure mode is covered by the resolve probe above.
+          python3 .agents/skills/audit-licenses/scripts/scan_licenses.py \
+            --repo . --platforms "$RELEASE_PLATFORMS" \
+            --json .agents-workspace/tmp/inventory-notices.json >/dev/null || true
+          python3 .agents/skills/audit-licenses/scripts/gen_notices.py \
+            --json .agents-workspace/tmp/inventory-notices.json \
+            --out .agents-workspace/tmp/THIRD_PARTY_NOTICES.regen.md
+          if diff -u THIRD_PARTY_NOTICES.md .agents-workspace/tmp/THIRD_PARTY_NOTICES.regen.md > notices.diff; then
+            echo "THIRD_PARTY_NOTICES.md is up to date"
+            exit 0
+          fi
+          echo "::error::THIRD_PARTY_NOTICES.md is STALE — a dependency changed but the notices were not regenerated. Run the audit-licenses skill (or: GOFLAGS=\"${GOFLAGS}\" python3 .agents/skills/audit-licenses/scripts/scan_licenses.py --repo . --platforms \"${RELEASE_PLATFORMS}\" --json inv.json && python3 .agents/skills/audit-licenses/scripts/gen_notices.py --json inv.json --out THIRD_PARTY_NOTICES.md) and commit the result." >&2
+          echo "--- dependency lines that changed (full diff also includes the license texts) ---"
+          grep -E '^[+-]\| `' notices.diff || true
+          echo "--- first 200 lines of the raw diff ---"
+          head -200 notices.diff
+          exit 1
+

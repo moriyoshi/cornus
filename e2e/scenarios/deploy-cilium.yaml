@@ -1,0 +1,15 @@
+# Two services on a `driver: cilium` network. cornus emits ONE shared
+# CiliumNetworkPolicy per network (endpointSelector + ingress fromEndpoints both
+# keyed on the cornus.net/<netLabel> membership label) — same-network reaches,
+# cross-network is denied, enforced by Cilium. Both services also resolve each
+# other by bare name via the services DNS baseline.
+services:
+  a:
+    image: nginx:alpine
+    networks: [secure]
+  b:
+    image: nginx:alpine
+    networks: [secure]
+networks:
+  secure:
+    driver: cilium

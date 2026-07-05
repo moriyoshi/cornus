@@ -1,0 +1,6 @@
+# Project A for socks5-coexist.star: a single nginx service `weba` (public image,
+# no build). Deploys as `coexa-weba`. Reached by the SHARED proxy in that scenario.
+name: coexa
+services:
+  weba:
+    image: nginx:1.27-alpine

@@ -1,0 +1,16 @@
+.git
+.gitignore
+*.md
+.agents/
+.agents-workspace/
+.claude/
+data/
+cornus-data/
+/cornus
+/bin/
+deploy/
+testdata/
+*.test
+*.out
+web/node_modules/
+docs/node_modules/
