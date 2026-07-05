@@ -1,0 +1,18 @@
+# Tier-3 runtime service-key fidelity fixture: one service sets user,
+# working_dir, hostname, read_only, tmpfs, sysctls, and labels, all of which
+# must actually reach the running container. Public image, no build.
+name: csk
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    user: "65534:65534"
+    working_dir: /tmp
+    hostname: csk-host
+    read_only: true
+    tmpfs:
+      - /cache
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "2048"
+    labels:
+      com.example.role: e2e

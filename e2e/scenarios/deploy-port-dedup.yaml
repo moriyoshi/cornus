@@ -1,0 +1,13 @@
+# A single service exposing the SAME container port (53) on BOTH tcp and udp.
+# On kube the netdriver headless alias Service (and the published Service) list
+# both ports; each ServicePort Name must be unique per protocol, or the API
+# server rejects the Service (spec.ports[1].name: Duplicate value) and the whole
+# deploy fails. The container need not actually serve DNS — the workload just
+# has to come up, proving the Service was accepted. See deploy-network.star.
+services:
+  dns:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"

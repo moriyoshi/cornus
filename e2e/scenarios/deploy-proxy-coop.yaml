@@ -1,0 +1,29 @@
+# Cooperative-proxy network. mesh sets driver_opts {proxy: "true", mode:
+# cooperative}: same-network peers reach each other THROUGH a no-privilege
+# sidecar (each peer name is pointed at a loopback the sidecar listens on).
+# coweb must declare its port via `expose:` so the sidecar knows to listen on it.
+# cooutsider is on a different plain network — cooperative isolation is SOFT, so
+# it stays directly reachable (the documented difference from enforcing mode).
+#
+# Service names are deliberately distinct from deploy-proxy.star's (web/client/
+# outsider): both scenarios share the kube namespace, and the `services` provider
+# names headless Services by bare service name, so colliding names would race
+# each other's create/GC across the two scenarios.
+services:
+  coweb:
+    image: nginx:alpine
+    expose: ["80"]
+    networks: [mesh]
+  coclient:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [mesh]
+  cooutsider:
+    image: nginx:alpine
+    networks: [other]
+networks:
+  mesh:
+    driver_opts:
+      proxy: "true"
+      mode: cooperative
+  other:

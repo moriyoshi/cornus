@@ -1,0 +1,289 @@
+# 接続設定リファレンス
+
+**接続設定** は、リモート cornus サーバーへの到達方法を記述する CLI 側の kubeconfig 風ファイルです。名前付き **コンテキスト** の集合であり、各コンテキストはエンドポイント、資格情報、TLS material、任意のクラスター内ポート転送対象を持ちます。これは developer の machine 上にあり、**サーバーから読まれることはありません** (サーバー側には別の data-directory 設定があります)。
+
+通常、このファイルは手で編集するのではなく [`cornus config`](/ja/cli/config) で管理しますが、format をここに document します。canonical な正本は [`pkg/clientconfig/clientconfig.go`](https://github.com/moriyoshi/cornus/blob/main/pkg/clientconfig/clientconfig.go) です。
+
+## ファイル location
+
+既定パスは platform user 設定ディレクトリの下の `cornus/config.yaml` です。
+
+- Linux/BSD: `~/.config/cornus/config.yaml`
+- macOS: `~/Library/Application Support/cornus/config.yaml`
+- Windows: `%AppData%\cornus\config.yaml`
+
+明示的に設定された `$XDG_CONFIG_HOME` は **すべての** OS で尊重されます (XDG に統一している user 向けの opt-in)。その場合、ファイルは `$XDG_CONFIG_HOME/cornus/config.yaml` になります。グローバル `--config-file` フラグと `CORNUS_CONFIG` 環境変数はパス全体を上書きします。
+
+このファイルは bearer トークンとキーパスを保持するため、`0700` ディレクトリの下にモード `0600` で書き込まれます。ファイルが存在しないことはエラーではありません。CLI は空の設定と同じように扱います。
+
+## Sample 設定
+
+```yaml
+current-context: staging
+contexts:
+  local:
+    server: http://127.0.0.1:5000
+
+  remote-docker:
+    # 静的サーバー URL を使わず、SSH 経由でリモートのループバックリスナーへ HTTP を転送します。
+    ssh-tunnel:
+      addr: devbox
+      user: ops
+      remote-addr: 127.0.0.1:5000
+
+  staging:
+    server: https://cornus.staging.example.com
+    # この環境のイメージはすべて Debian 系。まず bash を試す。
+    shells:
+      - /bin/bash
+      - /bin/sh
+    key-auth:
+      identity-file: /home/alice/.ssh/id_ed25519
+      key-fingerprint: SHA256:example
+      name: alice-laptop
+    tls:
+      ca-cert: /etc/cornus/staging-ca.pem
+    conduit:
+      mode: socks5
+      socks5:
+        listen: 127.0.0.1:1080
+        service-host-suffix: .cornus.internal
+      ingress:
+        mode: emulate
+        certificates:
+          - certificate: /etc/cornus/web.pem
+            key: /etc/cornus/web-key.pem
+
+  prod-cluster:
+    # No static server URL: dial the in-cluster Service via port-forward.
+    port-forward:
+      kube-context: prod
+      namespace: cornus
+      service: cornus
+      remote-port: 5000
+    kube-auth:
+      audience: cornus
+      expiration-seconds: 3600
+    registry-host: registry.prod.example.com:5000
+```
+
+## `File`
+
+top-level document です。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `current-context` | string | — | `--context` フラグが指定されない場合に使われるコンテキスト。空のは「コンテキスト未選択」を意味し、CLI はコマンドごとのフラグと環境変数に頼ります。 |
+| `contexts` | map[string][Context](#context) | — | 名前付き接続プロファイル。name をキーにします。 |
+
+## `Context`
+
+1 つの名前付きリモートエンドポイントと、それへ到達するための資格情報 / 転送経路 setting です。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `server` | string | — | cornus サーバー base URL (例: `https://cornus.example.com` または `http://127.0.0.1:5000`)。`port-forward` が設定され、`server` が空の場合、CLI はクラスター内サービスへ転送し、そのローカル end に接続します。 |
+| `registry-host` | string | derived from the サーバー | ビルドイメージのタグとデプロイプル ref に入る `host[:port]` を上書きします。空の (通常) なら導出します。CLI はサーバー (`GET /.cornus/v1/info`) に問い合わせ、フォールバックとして `server` エンドポイントのホストを使います。サーバーが introspect できない topology でのみ設定してください。 |
+| `token` | string | `CORNUS_TOKEN` env | `Authorization: Bearer` として送る bearer トークン / JWT。空の場合は `CORNUS_TOKEN` 環境変数にフォールバックします。 |
+| `tls` | [TLS](#tls) | system defaults | HTTPS エンドポイント用の任意の custom-CA / mTLS / insecure setting。 |
+| `port-forward` | [PortForward](#portforward) | — | 設定されている場合、接続前に CLI がポート転送するクラスター内サービス。 |
+| `kube-auth` | [KubeAuth](#kubeauth) | — | 設定されている場合、静的 `token` の代わりにクラスターから bearer トークンを導出します (Kubernetes TokenRequest API による短命 ServiceAccount トークン)。`token` より優先されますが、明示的な `CORNUS_TOKEN` 上書きには譲ります。 |
+| `key-auth` | [KeyAuth](#keyauth) | — | 設定すると、登録済み SSH 鍵の所有を証明し、短時間有効なセッションを発行します。`kube-auth` と `token` より優先されますが、`CORNUS_TOKEN` には譲ります。`key-auth` と `kube-auth` は同時に設定できません。 |
+| `via-server` | bool (nullable) | unset (直接) | ワークロード streaming operation (compose ログ、ポート転送) を、developer の kubeconfig でワークロード pod へ直接到達する代わりに cornus サーバープロキシ経由に強制します。クラスタープロファイルでのみ意味があります。`CORNUS_VIA_SERVER` env var と `--via-server` フラグより低い、最下位 precedence レイヤーです。transport-only であり、`kube-auth` トークン発行は無効化しません。 |
+| `conduit` | [Conduit](#conduit) | ポート転送 | クライアントセッションがデプロイメントのポートを呼び出し元に公開する方法。`CORNUS_CONDUIT` env var と `--conduit` フラグより低い、最下位 precedence レイヤーです。[ネットワークと conduit](/ja/guides/networking) を参照してください。 |
+| `ssh-tunnel` | [SSHTunnel](#sshtunnel) | — | `server` が空の場合、SSH 経由で cornus サーバーへ接続します。これはホストバックエンドにおける `port-forward` 相当で、2 つの自動転送は同時に使えません。明示的な `server` があると、このブロックは無効です。 |
+| `tunnel` | [Tunnel](#tunnel) | — | パブリックトンネル ([`cornus tunnel`](/ja/cli/tunnel)、[`cornus ingress-tunnel`](/ja/cli/ingress-tunnel)) の既定値。実行ごとに繰り返す必要がなくなります。 |
+| `shells` | 文字列のリスト | — | このプロファイル経由で到達するワークロード向けの対話シェル候補を、優先順に並べたもの。[`cornus web`](/ja/guides/web-ui#ターミナルのシェル探索) のターミナルが読み、まずワークロード自身の `x-cornus-shells:`、次にこれ、最後にブラウザー自身のリストの順にプローブします。各エントリーは分割済みの引数リストではなくコマンド**文字列**です (`/bin/busybox sh` は 1 エントリー)。セキュリティ上の機微なフィールドです。ワークロード内で実行されるバイナリを指名するため、プロジェクト上書きからは信頼済みのときにのみ供給されます。 |
+
+## `KeyAuth`
+
+短時間有効な Cornus クライアントセッションに使う SSH 署名者を選択します。プロファイルに保存するのはパスと公開鍵フィンガープリントだけで、秘密鍵の内容や発行済みセッショントークンは保存しません。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `identity-file` | string | — | ローカル SSH 秘密鍵のパス。暗号化済み鍵には通常の対話入力または `SSH_ASKPASS` を使います。 |
+| `key-fingerprint` | string | — | SHA256 公開鍵フィンガープリント。秘密鍵ファイルがなければ `SSH_AUTH_SOCK` から鍵を選択し、ファイルがあれば期待する公開鍵を固定します。バックグラウンドエージェントは鍵を解除せずにこの値でセッションキャッシュを参照できます。 |
+| `name` | string | フィンガープリント | 人間向けの登録名と、その結果となる呼び出し元 ID。 |
+| `scope` | string | `api` | 要求するセッションスコープ。 |
+| `ttl` | string | `1h` | 要求する Go duration 形式の有効期間。最長 `24h`。 |
+
+## `Conduit`
+
+コンテキストのセッション conduit preference です。モードと、SOCKS5 の場合はプロキシ setting を持ちます。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `mode` | string | `port-forward` | `port-forward` (ポートごとの自動転送、Compose-like) または `socks5` (単一のクライアント側 SOCKS5 スプリットトンネルプロキシ)。 |
+| `socks5` | [Socks5](#socks5) | — | SOCKS5 プロキシを調整します。`mode` が `socks5` の場合だけ参照されます。 |
+| `ingress` | [Ingress](#ingress) | — | ネイティブまたはエミュレートされたイングレス処理と、任意のユーザー提供サーバー証明書を設定します。 |
+
+## `Socks5`
+
+SOCKS5 スプリットトンネルプロキシを設定します。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `listen` | string | `127.0.0.1:1080` | プロキシがバインドするローカルアドレス。 |
+| `service-host-suffix` | string | `.cornus.internal` | 日常的な既定 resolution 規則を作ります。この接尾辞を持つ CONNECT ホストはサービス name に削られてトンネルされ、それ以外は直接エグレスします。`resolve` が設定されている場合は無視されます。 |
+| `resolve` | [][ResolveRule](#resolverule) | — | 接尾辞既定全体を置き換える advanced で ordered な resolution 規則 list。最初に match した規則が勝ちます。 |
+| `bare-service-names` | bool (nullable) | 有効 | 稼働中サービス名を表す素の single-label ホスト (例: `web`、`web.cornus.internal` に加えて) を内向きに経路するかどうか。サービス name が直接到達する real single-label ホストを shadow してしまう場合は `false` にします。 |
+
+## `SSHTunnel`
+
+リモートのコンテナホスト上の cornus サーバーへ接続するための SSH 接続を記述します。このトランスポートはバックエンドに依存しません。cornus サーバーへ raw バイトを運ぶだけなので、同じブロックで `dockerhost`、`containerd`、`bare`、`incus` のいずれのサーバーにもそのまま接続できます。設定後は通常のコマンドが透過的にこれを使うため、コマンドごとのトンネルフラグは不要です。`addr` には `ssh_config` のホスト alias を指定できます。`no-ssh-config` で無効にしない限り、通常のユーザー、ポート、ID、プロキシ、ホストキーの設定が適用されます。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `addr` | string | — | SSH 接続先。`ssh_config` の `Host` alias またはリテラルの `host[:port]`。 |
+| `user` | string | `ssh_config`、次に current user | SSH ログインユーザー。 |
+| `remote-addr` | string | `127.0.0.1:5000` | リモートホストから見た Cornus のリッスンアドレス。 |
+| `identity-file` | string | SSH agent / `ssh_config` | 公開鍵認証用の明示的な PEM 秘密鍵パス。 |
+| `no-agent` | bool | `false` | ローカルの `SSH_AUTH_SOCK` による認証を無効にします。 |
+| `known-hosts` | string | `ssh_config`、次に `~/.ssh/known_hosts` | ホストキー検証に使う明示的な `known_hosts` ファイル。 |
+| `host-key` | string | — | 期待する 1 つのホストキーを `authorized_keys` 形式の行として固定します。 |
+| `insecure-host-key` | bool | `false` | ホストキー検証を無効にします。開発用途専用です。 |
+| `remote-tls` | bool | `false` | リモートの cornus プロセスが TLS を終端するため、SSH トンネル内で HTTPS を使います。通常は `tls.server-name` と組み合わせます。 |
+| `no-ssh-config` | bool | `false` | ユーザーとシステム双方の SSH 設定ファイルを読み飛ばし、このブロックの明示的なフィールドだけを使います。 |
+| `use-ssh-binary` | bool | auto | 永続的な `ssh -N -L` フォールバック転送を強制します。解決済みホストに `ProxyCommand` がある場合、Cornus が自動的に選択し、`Match` を含む OpenSSH 設定全体が反映されます。 |
+
+## `Ingress`
+
+SOCKS5 conduit 経由で到達するイングレスを設定します。この証明書規則は、デタッチしたデプロイを含むネイティブ Kubernetes デプロイの前にも使われ、管理対象 TLS Secret を作成して接続します。この実体化では conduit を稼働し続ける必要はありません。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `mode` | string | off | `native` はクラスターのイングレスコントローラーを使い、`emulate` はローカルでイングレスを終端します。空または off ではイングレス処理を無効にします。 |
+| `controller` | [IngressController](#ingresscontroller) | 自動検出 | ネイティブイングレスコントローラー Service の上書き。 |
+| `ca-file` | string | 自動生成 | emulate モードのフォールバックリーフ証明書へ署名する CA 証明書。`ca-key-file` と一緒に指定する必要があります。 |
+| `ca-key-file` | string | 自動生成 | `ca-file` に対応する秘密鍵。 |
+| `certificates` | [][IngressCertificate](#ingresscertificate) | — | エミュレートとネイティブのイングレスで共有する、順序付きのユーザー提供サーバー証明書規則。 |
+
+## `Tunnel`
+
+パブリックトンネルのプロファイル単位の既定値です。**資格情報そのものは保存せず**、そのパスだけを保存するため、共有されたりリポジトリにコミットされたりするプロファイルから authtoken が漏れることはありません。
+
+| キー | 型 | 既定値 | 意味 |
+| --- | --- | --- | --- |
+| `authtoken-file` | string | — | トンネルバックエンドの資格情報を保持するファイルのパス。`--authtoken-file` の既定値として使われます。空の場合は実行ごとに渡すか、サーバー自身の既定値 (サーバー環境の `CORNUS_TUNNEL_AUTHTOKEN`) に頼ります。 |
+| `ingress-host-mode` | string | `auto` | [`cornus ingress-tunnel`](/ja/cli/ingress-tunnel)の `--host-mode` の既定値。`auto`、`passthrough`、`alias`、`rewrite` のいずれか。[Host の扱い](/ja/cli/ingress-tunnel#host-の扱い)を参照してください。 |
+
+明示的なフラグは常にこれらの既定値より優先されます。[`cornus setup`](/ja/cli/setup)は、サーバーが実際に何をホストできるかを調べたうえでこれらの入力を促します。
+
+## `IngressCertificate`
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `pattern` | string | 証明書の DNS SAN | 厳密な DNS 名、または `*.example.com` のような 1 ラベルのワイルドカード。明示的な pattern は証明書の SAN に含まれていなければなりません。厳密な規則はワイルドカードより優先され、ワイルドカード同士では接尾辞が最長のものが優先されます。 |
+| `certificate` | string | — | PEM 証明書チェーンへのパス。`key` と一緒に指定する必要があります。 |
+| `key` | string | — | 対応する PEM 秘密鍵へのパス。`certificate` と一緒に指定する必要があります。 |
+
+エミュレートされたイングレスでは、SNI が規則を選択し、一致しない名前には設定済みまたは自動生成のフォールバック CA を使います。ネイティブ Kubernetes イングレスでは、明示された具体的なすべてのイングレスホストがいずれかの規則に一致する必要があります。Cornus は同じ証明書を選択するホストをまとめ、ワークロード Deployment が所有する安定した `kubernetes.io/tls` Secret を作成し、証明書のローテーション時に更新して、Ingress に接続し、不要になった管理対象 Secret を削除します。管理対象証明書を使う場合、自動導出ホストと `@` トークンは具体的なホスト名へ展開する必要があります。
+
+ネイティブな実体化では秘密鍵のバイト列をデプロイ要求で送信するため、Cornus は HTTPS、SSH トンネル / custom dialer、またはループバック上の平文 HTTP (ローカル Kubernetes ポート転送を含む) でのみ許可します。リモートの平文 HTTP は、要求をシリアライズする前に拒否します。
+
+## `IngressController`
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `kube-context` | string | プロファイルのクラスタコンテキスト | ネイティブコントローラーのポート転送に使う kubeconfig コンテキスト。 |
+| `namespace` | string | — | イングレスコントローラー Service の名前空間。 |
+| `service` | string | 自動検出 | イングレスコントローラー Service 名。 |
+| `http-port` | int | 自動検出 | コントローラーの HTTP Service ポート。 |
+| `https-port` | int | 自動検出 | コントローラーの HTTPS Service ポート。 |
+
+## `ResolveRule`
+
+SOCKS5 resolution 規則 1 つです。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `pattern` | string | — | `host:port` CONNECT subject に対して test される regexp。 |
+| `replace` | string | — | `service:port` を生成する template (sed-style の `\1` backreference を受け付けます)。 |
+
+## `TLS`
+
+HTTPS エンドポイント用のクライアント側 TLS material です。どれも設定されていない場合、`Config()` は system 既定を返します。`client-cert` と `client-key` は一緒に設定する必要があります。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `ca-cert` | string | system trust ストア | サーバー証明書を検証する PEM CA bundle へのパス。サーバーの CA が system trust ストアにない場合に使います。 |
+| `server-name` | string | URL のホスト名 | SNI と証明書のホスト名を上書きします。たとえば、`remote-tls` で `127.0.0.1` 経由の証明書付きサーバーへ接続する場合に使います。 |
+| `insecure-skip-verify` | bool | `false` | サーバー証明書 verification を無効化します。testing のみ。 |
+| `client-cert` | string | — | mTLS 用 PEM クライアント証明書へのパス。 |
+| `client-key` | string | — | mTLS 用の対応する PEM クライアントキーへのパス。 |
+
+mTLS と bearer 認証のサーバー側については [セキュリティと認証](/ja/guides/security) を参照してください。
+
+## `PortForward`
+
+接続前に転送するクラスター内サービスです (CLI の service-forwarder が消費します)。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `kube-context` | string | current kube コンテキスト | 使用する kubeconfig コンテキスト。 |
+| `namespace` | string | — | サービスの名前空間。 |
+| `service` | string | — | 転送先サービス name。 |
+| `remote-port` | int | — | サービスポート。CLI は ready backing pod とその対象ポートに解決します。 |
+
+## `KubeAuth`
+
+cornus bearer 資格情報として発行する cluster-issued ServiceAccount トークンです。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `kube-context` | string | `port-forward` ブロックの値 | 発行先 kubeconfig コンテキスト。 |
+| `namespace` | string | `port-forward` ブロックの値 | ServiceAccount の名前空間。 |
+| `service-account` | string | — | トークンを発行する ServiceAccount。 |
+| `audience` | string | — | トークン audience。サーバーの `CORNUS_JWT_AUDIENCE` と一致する必要があります。 |
+| `expiration-seconds` | int64 | クラスター既定 | 要求するトークン lifetime。 |
+
+## `TokenExchange`
+
+上のフィールドが生成した資格情報を、[OAuth 2.0 Token Exchange](/ja/guides/security#サードパーティのトークンを-cornus-の資格情報と交換する) で短命の Cornus 資格情報と交換します。結果はコマンド間でキャッシュされます。
+
+| フィールド | 型 | 既定 | 説明 |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | 交換を実行します。 |
+| `scope` | string | — | 発行される資格情報を狭めます (例: `registry:pull`)。空の場合はサーバーのスコープマップが付与するものをそのまま受け取ります。 |
+
+```sh
+cornus config set-context cluster \
+  --pf-namespace cornus --pf-service cornus --pf-remote-port 5000 \
+  --kube-auth-service-account cornus-client --kube-auth-audience cornus \
+  --token-exchange --token-exchange-scope registry:pull
+```
+
+- どのフィールドが subject トークンを生成したかとは独立しているため、クラスターの ServiceAccount トークン、OIDC トークン、静的な `token` はすべて同じように交換されます。
+- `scope` は**狭める**ことしかできません。サーバーのポリシーが付与していないスコープは、黙って縮小されるのではなく拒否されます。そのため、スコープを固定したプロファイルは、その下でポリシーが変わったときに黙ってアクセスを得るのではなく、はっきり失敗します。
+- `key-auth` プロファイルはそのままにされます。その資格情報はすでに Cornus が発行したものでスコープを明示しているため、交換するものがありません。
+- 交換エンドポイントを持たないサーバー (古い Cornus、または JWT/JWKS 検証器を持たないもの) はエラーではありません。資格情報はこれまでどおり直接送信されます。
+
+発行された資格情報はキャッシュされるため、交換はコマンドごとではなくトークンの寿命ごとに一度だけ行われます。[`CORNUS_TOKEN_CACHE`](/ja/reference/server-env-vars) を参照してください。
+
+## プロジェクトコンテキスト上書き
+
+プロジェクトには、bare `Context` 文書である `cornus-context.json`、`cornus-context.yaml`、`cornus-context.yml`、または `cornus-context.toml` を置けます。Cornus は作業ディレクトリから上方向に検索し、最も近いファイルを使い、リポジトリルートまたはホームディレクトリで停止します。そのフィールドは選択した保存済みコンテキストに重ねられます。明示的なコマンドフラグと環境変数が引き続き優先されます。保存済みコンテキストが選択されていない場合にも接続を提供できます。
+
+```yaml
+server: https://cornus.staging.example.com
+via-server: true
+conduit:
+  mode: socks5
+```
+
+明示的なファイルには `--context-file PATH` または `CORNUS_CONTEXT_FILE=PATH` を使います。明示的に指定したファイルがない場合はエラーです。`--no-context-file` は検出を無効にし、`--context-file` と併用できません。
+
+### 信頼境界
+
+自動検出したファイルは、信頼済み資格情報ストアではなく作業ツリー入力です。既定では `via-server` だけを反映し、endpoint、token、TLS、registry、port-forward、kube-auth、SSH-tunnel、conduit、shells の設定は無視します。Unix では、別ユーザーが所有するファイル、または world-writable かつ non-sticky なディレクトリ内のファイルも無視します。
+
+`shells` は資格情報を含みませんが、この除去対象に入っています。web ターミナルがワークロード内で実行するバイナリを指名するため、プルリクエストを出せる誰もが書けるファイルにそれを選ばせてはならないからです。
+
+`--trust-context-file` / `CORNUS_TRUST_CONTEXT_FILE=1` は信頼できる作業ツリーでのみ使ってください。明示的に名前を指定した `--context-file` も信頼されます。endpoint を変更する上書きには独自の `token` または `kube-auth` が必要で、それがない場合は選択済みコンテキストの資格情報を破棄します。Cornus はプロジェクト上書きをスキップまたはフィールドを除去すると警告します。
+
+## 関連ページ
+
+- [`cornus config`](/ja/cli/config) - コンテキストの作成、選択、編集。
+- [ネットワークと conduit](/ja/guides/networking) - conduit モードとポート転送。
+- [リモートクラスターで作業する](/ja/guides/remote-clusters) - プロファイルからリモートサーバーを操作する方法。
+- [セキュリティと認証](/ja/guides/security) - bearer トークン、mTLS、クラスターが発行する ID。

@@ -1,0 +1,22 @@
+# Two ISOLATED networks (each policy=true, so each gets its own NetworkPolicy).
+# web serves on netb; friend shares netb (allowed); stranger is on neta and must
+# NOT be able to reach web (cross-network, denied by web's NetworkPolicy).
+services:
+  web:
+    image: nginx:alpine
+    networks: [netb]
+  friend:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [netb]
+  stranger:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [neta]
+networks:
+  neta:
+    driver_opts:
+      policy: "true"
+  netb:
+    driver_opts:
+      policy: "true"

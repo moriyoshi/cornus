@@ -1,0 +1,3179 @@
+/* ==========================================================================
+   cornus web UI — design system
+   Layers: tokens → base/typography → controls & forms → components → responsive
+   ========================================================================== */
+
+/* --- Design tokens -------------------------------------------------------- */
+:root {
+  /* Neutral surfaces & text */
+  --bg: #ffffff;
+  --bg2: #f4f5f7;
+  --bg-elevated: #ffffff;
+  --fg: #1a1d21;
+  --fg-dim: #5c6570;
+  --fg-muted: #8b95a1;
+  --border: #d8dde3;
+  --border-strong: #b7bfc9;
+
+  /* Brand accent (from cornus-logo.svg: #4b1dc7 → #b39af5) */
+  --accent: #4b1dc7;
+  --accent-hover: #3d17a3;
+  --accent-fg: #ffffff;
+  --accent-subtle: rgba(75, 29, 199, 0.1);
+  --accent-border: rgba(75, 29, 199, 0.35);
+
+  /* Keyboard focus. Defined once: the var(--accent) inside resolves against whatever
+     --accent the element inherits, so dark mode needs no second definition.
+     A SOLID stroke, not a tint. --accent-subtle is a 10% wash that measures ~1.2:1
+     against the page — under WCAG 2.2's 3:1 floor for a focus indicator — and it is
+     also the fill of the active nav pill and of .cmd-item's highlight, so a ring made
+     of it disappears against precisely the controls that most need one. 2px solid
+     --accent measures 8.2:1 on light, 5.8:1 on dark, and 7.0:1 on the nav pill. */
+  --focus-ring: 0 0 0 2px var(--accent);
+
+  /* Semantic */
+  --ok: #16a34a;
+  --warn: #b45309;
+  --bad: #dc2626;
+  --ok-subtle: rgba(22, 163, 74, 0.12);
+  --warn-subtle: rgba(180, 83, 9, 0.12);
+  --bad-subtle: rgba(220, 38, 38, 0.12);
+  /* The far end of the attention pulse (see .badge.attention). The same hue as
+     --warn-subtle at roughly 2.5x the alpha: enough of a swing to catch the eye in
+     peripheral vision, not so much that the badge changes what it looks like. */
+  --warn-strong: rgba(180, 83, 9, 0.32);
+  /* Text on a SOLID --warn fill, the warn twin of --accent-fg and chosen the same way. */
+  --warn-fg: #ffffff;
+  /* The far end of the number bullet's brightness pulse. It steps DOWN, not up: the
+     inverted disc carries text, and stepping down IMPROVES the contrast against a white
+     --warn-fg, where a brighter step would eat into it.
+
+     MEASURED, not picked by eye. The first attempt (#8a3f07) swung the disc's luminance by
+     1.77x in this theme and only 1.42x in dark — it animated correctly and read as
+     motionless on a 1.6em circle, which is the failure that looked like "the animation is
+     not running at all". These swing 3.08x and 2.12x, and the digit stays at 10.3:1 here
+     and 5.5:1 in dark, both clear of 4.5. */
+  --warn-deep: #6b2f05;
+
+  /* Categorical series colors — chart identity, and nothing else.
+     Eight hues in a FIXED order, assigned in sequence and never cycled: the order
+     is the colorblind-safety mechanism, so re-ordering or extending it is not a
+     style choice. Both modes were validated against this app's card surface
+     (--bg-elevated) for the lightness band, the chroma floor, adjacent-pair
+     separation under simulated protanopia/deuteranopia, and contrast:
+       light  worst adjacent CVD dE 9.1, normal-vision dE 19.6
+       dark   worst adjacent CVD dE 8.4, normal-vision dE 19.3
+     In light mode --series-3/4/5 sit below 3:1 on the surface, which is legal
+     only because every chart ships visible values (the legend carries each
+     series' latest, and each panel has a table view). Keep that true.
+     These are for MARKS only — text, including a series' own label, wears the
+     text tokens; identity comes from the colored key beside it. */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --leading-tight: 1.25;
+  --leading-normal: 1.55;
+  --leading-relaxed: 1.7;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* Spacing (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.1), 0 2px 4px rgba(16, 24, 40, 0.06);
+
+  /* Controls */
+  --control-h: 32px;
+  --control-px: 10px;
+  --transition: 120ms ease;
+
+  /* Layout */
+  --header-h: 52px;
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --bg2: #1f2229;
+    --bg-elevated: #1c1f26;
+    --fg: #e5e7eb;
+    --fg-dim: #9aa4af;
+    --fg-muted: #6b7480;
+    --border: #333842;
+    --border-strong: #464d59;
+
+    --accent: #a78bfa;
+    --accent-hover: #c4b5fd;
+    --accent-fg: #16181d;
+    --accent-subtle: rgba(167, 139, 250, 0.16);
+    --accent-border: rgba(167, 139, 250, 0.4);
+
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --ok-subtle: rgba(74, 222, 128, 0.14);
+    --warn-subtle: rgba(251, 191, 36, 0.14);
+    --bad-subtle: rgba(248, 113, 113, 0.14);
+    --warn-strong: rgba(251, 191, 36, 0.34);
+    --warn-fg: #16181d;
+    --warn-deep: #b8860f;
+
+    /* The same eight hues, re-stepped for the dark surface — a selected palette,
+       not an automatic lightening of the light one. */
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* --- Base & typography ---------------------------------------------------- */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+main {
+  flex: 1;
+  padding: var(--space-6) var(--space-8);
+  min-width: 0;
+  overflow-x: auto;
+  /* position:relative lets a full-bleed screen (the terminal workspace) fill the
+     content area via position:absolute without affecting other views. */
+  position: relative;
+}
+
+h1,
+h2,
+h3 {
+  line-height: var(--leading-tight);
+  letter-spacing: -0.01em;
+}
+h1 {
+  font-size: var(--text-xl);
+  font-weight: var(--fw-bold);
+  margin: 0 0 var(--space-5);
+}
+h2 {
+  font-size: var(--text-lg);
+  font-weight: var(--fw-semibold);
+  margin: var(--space-6) 0 var(--space-3);
+}
+h3 {
+  font-size: var(--text-base);
+  font-weight: var(--fw-semibold);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+.muted {
+  color: var(--fg-dim);
+  line-height: var(--leading-normal);
+}
+.error {
+  color: var(--bad);
+  white-space: pre-wrap;
+  line-height: var(--leading-normal);
+}
+/* The counterpart of .error for a situation nobody got wrong: the image simply has
+   no shell, the copy explains what to do next. Painting that in --bad would read as
+   a failure the user caused, and .muted would hide the one line that matters. */
+.warn {
+  color: var(--warn);
+  line-height: var(--leading-normal);
+}
+
+/* Consistent keyboard focus everywhere. The ring is drawn OUTSIDE the border box, so any
+   ancestor that scrolls or hides its overflow clips it away entirely — a scroll container
+   clips its descendants' ink overflow to its padding box, and a control that fills its
+   scrollport (the appbar's nav links, a pane's crumbs) has no room for a ring at all.
+   Wherever that happens the container has to lend the ring some slack; see .appbar-nav
+   and .stack-subheader .crumbs, which do it with padding cancelled by a negative margin
+   so the layout is unchanged. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}
+
+/* --- Layout: page header -------------------------------------------------- */
+/* The app shell is a single fixed bar pinned to the top of the viewport. It is
+   `position: sticky` rather than `fixed` so it still occupies a row in #root's
+   column flow: `main` keeps a definite height of `100vh - --header-h`, which is
+   what the full-bleed workspaces (Terminal, Files) size themselves against. */
+header.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  height: var(--header-h);
+  padding: 0 var(--space-5);
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+header.appbar .brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+header.appbar .brand-mark {
+  display: block;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+header.appbar .brand-name {
+  font-weight: var(--fw-bold);
+  font-size: var(--text-lg);
+  letter-spacing: -0.02em;
+}
+.appbar-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-x: auto;
+  /* The active pill is only as tall as the link, so a scrollbar-free bar keeps
+     the links vertically centred in the header. */
+  scrollbar-width: none;
+  /* Slack for the focus ring. overflow-x: auto makes overflow-y compute to auto too, and
+     this bar is exactly as tall as the pills inside it, so without the padding the ring
+     around a focused link is clipped on every side — the whole indicator, not a corner of
+     it. The negative margin gives the padding back to the header, so the links sit where
+     they always did. Nothing here may exceed --header-h; 2px ring + 4px pad cannot. */
+  padding: var(--space-1);
+  margin: 0 calc(-1 * var(--space-1));
+}
+.appbar-nav::-webkit-scrollbar {
+  display: none;
+}
+.appbar-nav a {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  white-space: nowrap;
+  color: var(--fg-dim);
+  text-decoration: none;
+  border-radius: var(--radius-pill);
+  font-weight: var(--fw-medium);
+  transition: background var(--transition), color var(--transition);
+}
+.appbar-nav a:hover {
+  color: var(--fg);
+  background: var(--accent-subtle);
+  text-decoration: none;
+}
+.appbar-nav a.active {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+/* --- Controls & forms ----------------------------------------------------- */
+input,
+select,
+textarea {
+  font: inherit;
+  font-size: var(--text-sm);
+  height: var(--control-h);
+  padding: 0 var(--control-px);
+  color: var(--fg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+textarea {
+  height: auto;
+  padding: var(--space-2) var(--control-px);
+  line-height: var(--leading-normal);
+  resize: vertical;
+}
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--border-strong);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-muted);
+}
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  cursor: pointer;
+  /* Chevron drawn in currentColor via inline SVG (color-agnostic). */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238b95a1' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M4 6l4 4 4-4'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 14px;
+}
+
+label {
+  display: inline-block;
+  font-size: var(--text-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-dim);
+  margin-bottom: var(--space-1);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+button {
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--fw-medium);
+  height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition),
+    color var(--transition);
+}
+button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--bg2);
+}
+button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+button.danger {
+  color: var(--bad);
+}
+button.danger:hover:not(:disabled) {
+  border-color: var(--bad);
+  background: var(--bad-subtle);
+}
+
+/* --- Components ----------------------------------------------------------- */
+table.grid {
+  border-collapse: collapse;
+  width: 100%;
+}
+table.grid th,
+table.grid td {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+table.grid th {
+  color: var(--fg-dim);
+  font-weight: var(--fw-semibold);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+table.grid tbody tr {
+  transition: background var(--transition);
+}
+table.grid tbody tr:hover {
+  background: var(--bg2);
+}
+table.grid td.wrap {
+  white-space: normal;
+  word-break: break-all;
+}
+
+/* File explorer (Files view) */
+/* A browse pane is a selection surface of its own — shift/ctrl-click and shift+Arrow pick
+   ROWS — so the browser must not also start a text range over it: dragging across rows
+   would paint a second, competing highlight, and the row highlight is the one that means
+   something. Deliberately scoped to the browse pane: an editor pane's text IS the
+   content (and CodeMirror drives its cursor from the DOM selection), so .file-editor is
+   left alone. */
+.file-pane {
+  -webkit-user-select: none;
+  user-select: none;
+}
+.fs-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: auto;
+  max-height: 60vh;
+  /* The offsetParent for the rows, so a band sweep's coordinates and the rows' offsetTop
+     are the same (scrolling) space. */
+  position: relative;
+  /* What the name column's cap is measured against (see .fs-name-cell). The listing's own
+     inline size, not the viewport's: a browse pane can be one tile of a split, and the cap
+     has to follow the tile. Safe to contain — a block in a flex column, its width already
+     comes from its parent and never from its contents. */
+  container-type: inline-size;
+}
+.fs-list:focus-within {
+  border-color: var(--accent);
+}
+/* The name column: one line, always. A name long enough to wrap makes its row two or
+   three times the height of its neighbours, and this listing is something you scan down
+   and sweep across — an uneven column of rows breaks the scan, and a row whose height
+   depends on its text makes the drag-select band's arithmetic (rows measured by
+   offsetTop) something you have to look at to predict. So the name clips instead, and the
+   tail is on the row's title.
+
+   The column takes its CONTENT's width, not the pane's: the trailing spacer column (see
+   .fs-pad) is the one holding `width: 100%`, so the slack collects there and the names stay
+   in a block beside their metadata instead of being ruled off from it by an arm's length of
+   empty cell.
+
+   The cap is what keeps that honest, and it is also the edge the ellipsis truncates
+   against — a content-sized column has none, and a nowrap cell with no cap simply widens
+   the table until the listing scrolls sideways. Two terms, because they answer different
+   questions. `55cqw` is the share of the pane one name may take before it is crowding the
+   other columns. `100cqw - 19rem` is what is physically left after them: they are nowrap
+   and cannot yield, so a cap above this trades the clipped tail of one name for a
+   horizontal scrollbar on the whole listing, which is the worse of the two. 19rem is
+   measured (Size + Kind + Modified come to ~17rem at --text-sm, and Modified is a
+   fixed-format timestamp, so it does not grow with the data); overshooting it only leaves
+   the spacer a few idle pixels, undershooting brings the scrollbar back. */
+.fs-list table.grid td.fs-name-cell {
+  max-width: min(55cqw, calc(100cqw - 19rem));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The spacer column: no header, no content, no padding — it exists to be the column the
+   table's leftover width is given to. Without it that slack lands on the name column (the
+   only one that can absorb it), which is what pushed the names an arm's length from the
+   metadata they belong to. It collapses to nothing as the names grow. */
+.fs-list table.grid .fs-pad {
+  width: 100%;
+  padding: 0;
+}
+/* NO app ring inside the listing. Everywhere else the ring is the answer to "where am I";
+   here it is the wrong shape for the question. Focus sits on the name LINK (the rows carry
+   a roving tabindex on it), so the ring boxes a word inside a row rather than marking the
+   row, and it does that on top of two cues that already point at the same place: the row's
+   own `.fs-selected` fill — focusing a row selects it — and the list's accent border from
+   :focus-within. Three marks for one fact, and the smallest of them is the only one that
+   is not row-shaped. The list itself is only focusable when it is EMPTY, where a ring round
+   the whole empty box says nothing the border has not already said. */
+.fs-list:focus-visible,
+.fs-list a:focus-visible {
+  box-shadow: none;
+}
+/* What replaces it, because dropping the ring outright would lose one fact the other two
+   cues do not carry: which row the CURSOR is on inside a multi-row selection. Shift+Arrow
+   extends the range and every row in it wears the same fill, so without this the next
+   Arrow's origin is unreadable. A 2px bar down the leading edge of the row — matched to
+   the ring's own weight — is row-shaped, which is the thing the ring was not. */
+.fs-list table.grid tbody tr:focus-within > td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.fs-list table.grid th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-elevated);
+  z-index: 1;
+}
+.fs-list table.grid tbody tr {
+  cursor: default;
+}
+.fs-list table.grid tbody tr.fs-selected {
+  background: var(--accent-subtle);
+}
+.fs-list table.grid tbody tr.fs-selected:hover {
+  background: var(--accent-subtle);
+}
+.fs-updir {
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+/* What the pointer carries during a drag. The canvas stays TRANSPARENT — only the label
+   travels, not a slab of the row it came from — and it is parked off-screen because
+   setDragImage snapshots it while it is in the document. */
+.fs-drag-ghost {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--text-sm);
+  font-weight: var(--fw-medium);
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+}
+/* One row per dragged item. Long names are clipped rather than allowed to stretch the
+   ghost across the viewport. */
+.fs-drag-ghost-row,
+.fs-drag-ghost-more {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The trailing "+N more" line: a count, so it reads as secondary to the named rows. */
+.fs-drag-ghost-more {
+  color: var(--fg-dim);
+  font-weight: var(--fw-medium);
+}
+/* A row for an item still in flight: drawn when a drop starts, replaced by the real row
+   when the listing returns it, wiped if the transfer failed. Dimmed and italic so it
+   never reads as a file you can act on — and it cannot be: it carries no link, no
+   selection and no drag handle. */
+.fs-list table.grid tbody tr.fs-ghost {
+  color: var(--fg-muted);
+  cursor: default;
+}
+/* The glyph would otherwise stay at full strength and shout over the greyed text. */
+.fs-list table.grid tbody tr.fs-ghost .fs-icon {
+  opacity: 0.5;
+}
+/* A row a drop just put here (or the folder that received it, when the items landed out
+   of sight inside one). A brief tint that fades on its own, so the eye can find what
+   arrived without it reading as a selection. The class is removed on a timer too, so a
+   row that is later selected is not competing with a stale animation. */
+.fs-list table.grid tbody tr.fs-arrived {
+  animation: fs-arrived 1.9s ease-out;
+}
+@keyframes fs-arrived {
+  0%,
+  45% {
+    background: var(--accent-subtle);
+  }
+  100% {
+    background: transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fs-list table.grid tbody tr.fs-arrived {
+    animation: none;
+    background: var(--accent-subtle);
+  }
+}
+/* Drop target during a drag: the folder row about to receive, or the whole pane when the
+   drop lands in its current folder. Drawn as an OVERLAY above the listing rather than as
+   an inset shadow on the box itself — the row separators are cell borders and the column
+   header is sticky with its own stacking context, both of which paint over a shadow on
+   the row/pane box, so the ring came out broken between rows and clipped along the top.
+   It also cannot change any layout: the ring is out of flow and takes no clicks. */
+.fs-drop-here {
+  position: relative;
+}
+.fs-drop-here::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 3; /* above the sticky header (1) and the selection count (2) */
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-subtle);
+}
+/* The multi-selection count sits in the breadcrumb lane, right-aligned, instead of taking
+   a row of its own: nothing reflows as the selection grows and shrinks. It is an OVERLAY,
+   not a flex item, so the crumbs still get the whole lane when nothing is selected; the
+   gradient shades the crumb trail out underneath it (the crumbs keep their tail visible,
+   so the two would otherwise collide), and pointer-events stay with the crumb links. */
+.stack-subheader .fs-selection-count {
+  position: absolute;
+  inset: 0 0 0 auto;
+  z-index: 2;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  padding-left: 3rem;
+  padding-right: var(--space-2);
+  background: linear-gradient(to right, transparent, var(--bg2) 2.5rem);
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
+/* A stopped-workload mount at the virtual root: shown but not enterable. */
+.fs-list table.grid tbody tr.fs-disabled {
+  opacity: 0.55;
+}
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+  font-size: var(--text-sm);
+}
+.crumbs a {
+  color: var(--fg-dim);
+}
+.crumbs a:hover {
+  color: var(--accent);
+}
+.crumb-sep {
+  color: var(--fg-muted);
+}
+.fs-icon {
+  display: inline-block;
+  margin-right: var(--space-2);
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-weight: var(--fw-medium);
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--fg-dim);
+}
+.badge.ok {
+  color: var(--ok);
+  border-color: transparent;
+  background: var(--ok-subtle);
+}
+.badge.warn {
+  color: var(--warn);
+  border-color: transparent;
+  background: var(--warn-subtle);
+}
+.badge.bad {
+  color: var(--bad);
+  border-color: transparent;
+  background: var(--bad-subtle);
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-3);
+}
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-sm);
+}
+.card h3 {
+  margin: 0 0 var(--space-2);
+}
+/* A card can carry a second block under its own title — the Overview's Workloads
+   card holds the counts and then the live terminal sessions. `h4` labels it,
+   sized DOWN from the card title and dimmed so the card still reads as one panel
+   with one name; matching h3 here would read as two cards that lost their
+   border. */
+.card h4 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-dim);
+  line-height: var(--leading-tight);
+}
+/* Nothing follows the last block in a card, so its trailing margin is padding the
+   card already provides. */
+.card > :last-child {
+  margin-bottom: 0;
+}
+/* A table inside a card scrolls at EVERY width, not just under the breakpoint
+   (where `.table-scroll` normally lives). A card is the narrowest container in
+   the app: a cell of a `minmax(260px, 1fr)` grid is narrower at 1200px than the
+   whole page is on a phone. Measured on the Overview's sessions table before this
+   rule existed: 345px of table in a 237px card, spilling 107px past the card's
+   right edge — under the NEXT card, which paints over it and makes the clipping
+   look deliberate — with `scrollLeft` pinned at 0, so the State column was simply
+   unreachable on desktop. */
+.card .table-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* Segmented control: the Overview grouping toggle (By project / By workload). */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  margin: var(--space-4) 0 var(--space-2);
+  padding: 2px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.seg button {
+  height: auto;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+}
+.seg button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--fg);
+}
+.seg button.active {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--fg);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Project sections on the Overview dashboard: each groups a project's workloads,
+   mounts, and port-forwards, separated by a rule so the boundaries read clearly. */
+/* One band of a stacked page: a rule above it, its own heading, its own content.
+   The Overview's project and workload sections and the workload detail page's
+   instances / spec / metrics / logs are all this — which is why it is named for
+   the shape and not for the project it started as. */
+.section {
+  display: block;
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 2px solid var(--border);
+}
+.section > h3 {
+  margin-bottom: var(--space-2);
+}
+
+pre.log {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  max-height: 480px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-4);
+  line-height: var(--leading-normal);
+}
+.kv dt {
+  color: var(--fg-dim);
+}
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+}
+/* A `.row` inside a kv VALUE is one entry's content, not a list of entries, and in
+   a card it wraps often — the value column of a `minmax(260px, 1fr)` card is around
+   150px, so a name plus a chip does not fit on one line. `.row`'s own 8px gap
+   applies to the wrapped line too, which is WIDER than `.kv`'s 4px row gap: the
+   chip then sits closer to the next label than to its own, and reads as that
+   label's value. Anything under 4px re-attaches it to the line it belongs to. */
+.kv dd .row {
+  row-gap: 2px;
+}
+
+.editor-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.editor-wrap .cm-editor {
+  max-height: 65vh;
+}
+.editor-wrap .cm-editor.cm-focused {
+  outline: none;
+}
+
+.term-wrap {
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  min-height: 320px;
+}
+
+/* --- Tiled terminal workspace --------------------------------------------- */
+/* A full-bleed screen: fills main's content box and manages its own layout, so
+   the split tree can size panes to the viewport regardless of document flow. */
+.workspace {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  /* Small padding so the tiled panes nearly reach the workspace edges — a large
+     gutter here becomes a dead zone in front of the outermost panes' edge-split
+     overlays (notably the leftmost pane's left edge). */
+  padding: var(--space-2);
+  overflow: hidden;
+}
+/* THE PANE CHOOSER'S GUTTER. Pinned, the chooser is not a card over the tiles any more but a
+   column beside them, so the workspace turns into a row and the body gives up the width. The
+   `gap` lives here rather than on the panel because it is the space BETWEEN two things, and
+   only exists while there are two. */
+.workspace.chooser-pinned {
+  flex-direction: row;
+  gap: var(--space-2);
+}
+/* No `min-width: 0` on the body, though a flex row full of oversized content is where that rule
+   normally belongs. It was written, and the measurement pass then refused to fail when it was
+   set back to `auto`: the body is `overflow: auto`, and a flex item whose overflow is anything
+   but `visible` already has an automatic minimum size of zero. The rule was inert, and its
+   comment claimed a failure that does not happen. Left as a note so it is not added back. */
+/* Which side. `order` rather than `row-reverse`, because the reverse would flip every OTHER
+   in-flow child too if one is ever added, and because this is a statement about one element:
+   the gutter goes first. */
+.workspace.chooser-left > .pane-chooser.pinned {
+  order: -1;
+}
+/* The workspace has a single child now that the title/hint toolbar is gone (the
+   header nav already names the screen), so there is nothing to `gap` against.
+
+   It is also the SCROLL CONTAINER for the extending layout: the canvas inside it is sized in
+   multiples of this box, so at an extent of 1 it is exactly this box and nothing scrolls —
+   which is the fixed-viewport layout, unchanged. Past 1 the screen becomes a window onto a
+   larger workspace.
+
+   `overscroll-behavior: contain` stops a two-finger pan that runs off the end of the workspace
+   from turning into a browser back-navigation, which on a screen holding live terminals is the
+   most expensive misfire available. */
+.workspace-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+/* Sized inline from the workspace extent (see Workspace.tsx). `flex: 0 0 auto` so it keeps the
+   size it was given instead of being shrunk back to the container by the flex line; the min-*
+   pair is what makes a workspace that has shrunk back to one screen still fill it. */
+.workspace-canvas {
+  display: flex;
+  /* A COLUMN, so the bottom edge handle can sit under everything else; the row inside carries
+     the tree and the right-hand one. */
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-width: 100%;
+  min-height: 100%;
+}
+.workspace-rows {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+/* The workspace's own borders, as drag handles. `.divider` already gives them their look, their
+   6px (14px on a coarse pointer) hit area and their `touch-action: none`; these two rules only
+   place them, since they are not inside a `.split` and so are not covered by the `.split.h > .divider`
+   pair that sets the cursor. */
+.divider.edge-right {
+  cursor: col-resize;
+}
+.divider.edge-bottom {
+  cursor: row-resize;
+}
+
+/* A split arranges two children along an axis; children flex-grow by ratio so the
+   fixed divider never throws the proportions off. */
+.split {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.split.h {
+  flex-direction: row;
+}
+.split.v {
+  flex-direction: column;
+}
+.split-child {
+  display: flex;
+  flex-basis: 0;
+  flex-shrink: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.divider {
+  flex: 0 0 6px;
+  background: var(--border);
+  transition: background var(--transition);
+  touch-action: none;
+}
+.split.h > .divider {
+  cursor: col-resize;
+}
+.split.v > .divider {
+  cursor: row-resize;
+}
+/* A 6px handle is about 1.6mm — reachable with a cursor, not with a finger. It grows by
+   moving the tiles APART, never by a ::before overlay: a pseudo-element is not an event
+   target, so events over it would report `.divider` as their target and `ownerOf()` in
+   panes.tsx would resolve "this is the divider" for pixels lying INSIDE the neighbouring
+   tiles' 20px edge-split strips. Those columns would then quietly stop arming — killing
+   the only split gesture a mouse has, in the tiles most likely to be split. flex-basis
+   keeps edgeAt()'s arithmetic and the painted geometry the same thing. Coarse pointers
+   only: 8 extra px per split is real estate a mouse has no use for.
+
+   Note the tab bar is deliberately NOT enlarged here. It stays at its 27.59px whatever
+   the pointer, so no screen loses a row of terminal to touch support; the ⋮ pane menu is
+   what keeps every operation reachable, rather than a taller bar. */
+@media (pointer: coarse) {
+  .divider {
+    flex-basis: 14px;
+  }
+  /* Stops a double-tap near these from being read as zoom, which costs 300ms. */
+  .tab,
+  .tab-close,
+  .pane-menu,
+  .pane-pick-zone {
+    touch-action: manipulation;
+  }
+  /* A LONG PRESS on any of these is a drag (dnd.ts), and the platforms want it for
+     themselves: iOS raises the selection callout and the share sheet over a link, Android
+     starts a text selection. Both would fire in the middle of the dwell and leave the user
+     holding a menu instead of a tab. The drag also refuses the contextmenu event itself —
+     this is the half of the veto that has to be declared before the press, not during it.
+
+     The file NAME is a real link (so it can be opened, and dragged out to the desktop by a
+     mouse), which is exactly why its row needs saying too. */
+  .stack-tabs,
+  .tab,
+  .fs-list tbody tr,
+  .fs-list tbody tr a {
+    -webkit-touch-callout: none;
+  }
+}
+
+/* An emulated drag in flight, on <html>. The cursor has to be repeated over `*` because
+   every element under the pointer carries its own — the tab that was grabbed says `grab`,
+   the pane body says `text` — and the one thing that must not happen mid-drag is the cursor
+   claiming the gesture has not started. The selection lock is the same argument as the tab
+   bar's, for the surfaces a drag crosses rather than the one it began on. */
+html.dnd-dragging,
+html.dnd-dragging * {
+  cursor: grabbing !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+.divider:hover {
+  background: var(--border-strong);
+}
+
+/* A tile is a STACK: a tab bar over a body. A single-pane stack renders as a plain
+   pane; two or more panes render as tabs. */
+.stack {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--bg-elevated);
+}
+.stack.focused {
+  border-color: var(--accent-border);
+}
+/* Drag-to-rearrange: the tile hovered as a drop target gets an accent ring + overlay;
+   a tile dragged as a whole stack dims. */
+.stack.drop-target {
+  border-color: var(--accent-border);
+}
+.stack.dragging {
+  opacity: 0.5;
+}
+/* Both rings double the tile's border from just inside it, and both are OVERLAYS rather
+   than an inset shadow on the tile box. An inset shadow paints below every descendant, so
+   the listing's opaque sticky header (--bg-elevated) and its hovered row (--bg2) painted
+   straight over the ring: it survived only beside the rows that happened to be
+   transparent, reading as a 1px border on each row that blinked out under the cursor.
+   Same failure the pane's own drop ring documents at .fs-drop-here below. Out of flow and
+   click-through, so the ring can neither reflow the tile nor swallow a press meant for
+   the pane. */
+.stack.focused::after,
+.stack.drop-target::after,
+.stack.previewed::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 4; /* over the sticky header (1), the selection count (2), the pane ring (3) */
+  pointer-events: none;
+  border: 1px solid var(--accent-border);
+  /* The containing block is the padding box, so the tile's radius less its border. */
+  border-radius: calc(var(--radius-md) - 1px);
+}
+/* A drop target outranks focus: the tile under the drag is what the press will act on. */
+.stack.drop-target::after {
+  border-width: 2px;
+  border-color: var(--accent);
+}
+/* The pane chooser's preview. It has to be told apart from the FOCUS ring at a glance,
+   because during that mode both are on screen at once and the whole point of the mode is
+   that they are not yet the same tile: the focused tile keeps its 1px hairline, and the tile
+   the walk has reached is filled as well as ringed. The fill is the same --accent-subtle a
+   pick's candidate tiles wear — it is the workspace's one "this tile is the subject" tint —
+   and it lies over the pane's content, which is legible enough through it and is not being
+   read at this moment anyway. */
+.stack.previewed::after {
+  border-width: 2px;
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+/* The tab bar (also the drag handle for each tab and the header for a single pane). */
+.stack-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* The bar's empty area is the whole-stack drag handle. */
+  cursor: grab;
+  /* The bar and its tabs are a drag surface, and the drag is a POINTER drag now (dnd.ts):
+     nothing suppresses the browser's own press-and-sweep, so without this a mouse drag
+     paints a text selection across the tab labels on its way to the target. Tab labels are
+     control text, not prose — there is nothing here anyone means to select.
+
+     Deliberately NOT `touch-action: none`, which would be the obvious way to keep a finger
+     from scrolling mid-drag: this bar scrolls horizontally (overflow-x above) and must go
+     on doing so. The dwell is what separates the two gestures, and the drag vetoes the
+     scroll only once it has lifted — see dnd.ts. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+.stack-tabs:active {
+  cursor: grabbing;
+}
+.stack-tabs::-webkit-scrollbar {
+  display: none;
+}
+.stack-tabs-spacer {
+  flex: 1 1 auto;
+  min-width: var(--space-2);
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 16rem;
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  color: var(--fg-dim);
+  cursor: grab;
+  white-space: nowrap;
+}
+.tab:active {
+  cursor: grabbing;
+}
+.tab.active {
+  background: var(--bg-elevated);
+  color: var(--fg);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.tab.dragging {
+  opacity: 0.45;
+}
+/* The chooser's preview, on the tab bar. The tile's ring says which TILE the walk has
+   reached; this says which of its tabs, which is the half a ring cannot express — the
+   previewed tab is often not the one the tile is showing. */
+.tab.previewed {
+  background: var(--accent-subtle);
+  color: var(--fg);
+}
+/* A tab's label is two things with very different claims on the space: the NAME, which
+   can be any length and reads perfectly well abbreviated, and the activity badge, which
+   is short, fixed-width, and the entire point of the indicator.
+
+   They used to be one clipped inline run: `.tab-label` is a flex item of `.tab` (so it is
+   blockified, and `overflow: hidden` gives it an automatic minimum size of 0), which means
+   it shrinks to whatever `.tab`'s `max-width: 16rem` leaves and CLIPS what does not fit.
+   The name comes first, so the name kept the width it wanted and the badge — sitting after
+   it — was the first thing cut off. The failure hid behind a width threshold and behind the
+   badges not being the same width: with a long enough label, "working" fits where
+   "needs you" does not, so the indicator appeared to blank out at exactly the moment a
+   session started needing a human. What was left was the badge's clipped padding, which
+   reads as an empty gap after the title.
+
+   The name is now the only shrinkable child, so the badge is never what gives way. This
+   also un-loads the measured hack below: `.tab-label` was a block whose line box the
+   badge's inline-block BASELINE could grow, which is what made the bar jump when a session
+   started working; centred flex items have no baseline effect, so the row is the taller of
+   the two boxes and the badge (smaller font, tight leading) is not it. NOTE the bar's
+   height is browser-measured territory — see the badge rule further down — and this
+   change was reasoned, not re-measured. */
+.tab-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.tab-name {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* A terminal tab's activity badge ("working" / "needs you") must fit INSIDE the tab's
+   own line box, so the bar keeps its height whether or not a session is badged. The
+   default .badge is built for a card — 18px leading plus 2px padding and a hairline on
+   each side, 24px in all, against a line box of 18.59px — so it made the bar 33px, and
+   the tile's body jumped by 5.41px every time a session started or stopped working.
+   The leading tightens and the vertical padding goes; the hairline STAYS, because the
+   neutral (no-variant) badge is filled with --bg2, which is also the background of an
+   inactive tab — without its border, "working" would be invisible on every tab but the
+   active one. It is the badge's inline-block BASELINE that decides the line box, not
+   its height, so this is measured in a browser, not reasoned about: 17px outer, bar
+   back to 27.59px.
+
+   ONE RULE, BOTH PLACES. The pane chooser lists panes with the same `ctx.tabTitle`, so the
+   same badge appears there; scoped to `.tab` alone it fell back to the card-sized default
+   and the two views showed the same state at two different sizes. Two rules that agreed
+   today would drift the next time this one is touched.
+
+   Not in EVERY chooser row: a caller's question ("Copy 3 items to…") asks tabTitle for a
+   plain label and gets no badge at all, because those rows are destinations rather than
+   panes standing for themselves. That is a decision about what to RENDER, made in
+   PaneChooser — nothing here hides anything, and this rule keeps sizing whatever arrives. */
+.tab .badge,
+.pane-chooser-label .badge {
+  padding: 0 var(--space-2);
+  line-height: var(--leading-tight);
+  /* Never the thing that shrinks. Both containers are flex rows whose NAME carries the
+     whole ability to give way; without this the badge would shrink below its own text and
+     clip the word it exists to show. */
+  flex: 0 0 auto;
+}
+/* The pane menu (⋮) — the tile's tap-reachable route to split / new tab / move / close.
+   Every gesture it replaces is mouse-only: the edge-split overlays need a 450ms hover
+   dwell and the tab rearrange is HTML5 drag-and-drop, neither of which touch has. It is
+   NOT gated on a coarse pointer: those queries answer for the primary pointer and go
+   stale on a convertible, and the dwell is undiscoverable with a mouse anyway.
+
+   `position: sticky` is the load-bearing part. .stack-tabs is `overflow-x: auto` and the
+   spacer before this button only pushes it right while the bar has slack — past about
+   four tabs the bar scrolls and an ordinary flex-end button leaves the viewport, i.e.
+   the always-reachable affordance becomes unreachable exactly when the tile is busiest.
+   Sticky pins it to the right edge of the scroll port instead, and the opaque background
+   is what stops tabs sliding visibly under it. */
+.pane-menu {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  flex: 0 0 auto;
+  /* The header must not get taller. Three things would make it so, and all three are
+     reset here: the global `button { height: var(--control-h) }` (32px against a 27.59px
+     bar), that rule's vertical-free but wider `--text-sm`, and its 1px border. With
+     `height: auto` the button STRETCHES to the bar (.stack-tabs is align-items: stretch)
+     instead of defining it — so its own box can never be what sets the height. Same
+     reset, for the same reason, as .pane-split-zone. */
+  height: auto;
+  min-height: 0;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: 0;
+  background: var(--bg2);
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+  /* Stretched to the bar, so the glyph has to be centred in it rather than sitting on
+     the first line. */
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  cursor: pointer;
+}
+.pane-menu:hover {
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+.tab-close {
+  flex: 0 0 auto;
+  height: 16px;
+  padding: 0 var(--space-1);
+  line-height: 1;
+  opacity: 0;
+}
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  opacity: 1;
+}
+/* An always-invisible but always-TAPPABLE control is a trap: opacity does not remove hit
+   testing, so on a device with no hover the ✕ on a background tab is a live 16px target
+   with nothing drawn on it — a tap near a tab's right edge closes the pane and nothing
+   ever said it would. Both queries, because a device that answers only one of them is
+   still a device that cannot hover. `:focus-within` is the same bug reached by keyboard,
+   and needs no query at all. */
+@media (pointer: coarse), (hover: none) {
+  .tab-close {
+    opacity: 1;
+  }
+}
+.tab:focus-within .tab-close {
+  opacity: 1;
+}
+.stack.solo .tab-close,
+.stack-tabs.solo .tab-close {
+  opacity: 1;
+}
+
+/* The sub-header row (e.g. the Files refresh + breadcrumb) sits under the tab bar. */
+.stack-subheader {
+  flex: 0 0 auto;
+  /* The positioning context for the Files selection-count overlay (.fs-selection-count). */
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+.stack-subheader .pane-refresh {
+  flex: 0 0 auto;
+  height: 18px;
+  padding: 0 var(--space-1);
+  line-height: 1;
+}
+
+/* Drop indicator: highlights where the dragged pane will land — the whole tile for a
+   center "stack", or the half it will occupy for an edge "move". */
+.pane-drop-indicator {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-sm);
+  font-weight: var(--fw-medium);
+  color: var(--accent);
+  background: var(--accent-subtle);
+  box-shadow: inset 0 0 0 2px var(--accent);
+  pointer-events: none;
+  z-index: 6;
+}
+.pane-drop-indicator.zone-stack {
+  inset: 0;
+}
+.pane-drop-indicator.zone-left {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 50%;
+}
+.pane-drop-indicator.zone-right {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  right: 0;
+}
+.pane-drop-indicator.zone-top {
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 50%;
+}
+.pane-drop-indicator.zone-bottom {
+  left: 0;
+  right: 0;
+  top: 50%;
+  bottom: 0;
+}
+/* Tap-to-pick: the touch replacement for dragging a tab onto another tile. HTML5
+   drag-and-drop is never synthesized from touch, so without this the whole move/stack
+   half of the workspace is unreachable on a tablet. The pane menu arms the mode; every
+   candidate tile then wears these five buttons.
+
+   Discrete buttons rather than the geometric regions a mouse drag reads: a two-way split
+   on a phone is ~170px wide, which would put "left" and "right" at ~51px each — under a
+   fingertip, with no hover preview to correct against before the tap commits. */
+.pane-pick-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 7; /* over the split strips (5) and the drop indicator (6) */
+  /* A tight plus, centred, whatever the tile's proportions. Positioning the arms as a
+     PERCENTAGE of the tile instead put the vertical pair ~450px from the horizontal one
+     in a full-height pane — five scattered buttons rather than one readable cross. */
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  grid-template-rows: repeat(3, auto);
+  place-content: center;
+  gap: var(--space-2);
+  /* Marks the tile as a candidate without hiding what is in it. */
+  background: var(--accent-subtle);
+  /* The cluster is the only live part: a tap on the rest of the tile is a tap on none of
+     the five zones, and must reach the scrim underneath and cancel — not be swallowed
+     here, which would make the mode feel stuck everywhere except five small squares. */
+  pointer-events: none;
+}
+.pane-pick-zone {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Sized for a fingertip, and identical on every tile — a cross that shrinks with its
+     pane would be smallest exactly where the panes are most crowded. These also REPLACE
+     the global `button { height: var(--control-h) }`; 44px is the touch floor, and it is
+     taller than the 32px control height it overrides, so nothing here is a reset. */
+  width: 56px;
+  height: 44px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--accent);
+  font-size: var(--text-lg);
+  line-height: 1;
+  opacity: 0.92;
+}
+.pane-pick-zone:hover {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+  opacity: 1;
+}
+/* The tile the keys act on. Focus lives on the OVERLAY, not on any one target — a direction
+   key acts on the whole tile — so the "you are here" cannot be a ring around a button. Nor
+   can it be the app's own ring: `--focus-ring` boxes the ELEMENT that will act on the next
+   key, and drawn around the whole overlay it would promise that the overlay is the thing
+   being chosen, when the answer to this question is a direction. Instead the tile's five
+   targets all come up to full strength, which reads as one lit cross against the dimmer
+   ones — and the tile's own `.stack.focused` border frames it, because focusing the overlay
+   drives the tile's focusin. The suppression below is therefore deliberate, not an
+   oversight: the ring is visible here, and is the wrong statement. */
+.pane-pick-overlay:focus {
+  outline: none;
+  box-shadow: none;
+}
+.pane-pick-overlay:focus .pane-pick-zone {
+  border-color: var(--accent);
+  opacity: 1;
+}
+/* The plus. Grid cells, so the five can never overlap however small the tile gets — the
+   reason the centre no longer has to be ordered after the arms to avoid swallowing them.
+   The corners stay empty and, being pointer-events: none, cancel. */
+.pane-pick-zone.zone-top {
+  grid-area: 1 / 2;
+}
+.pane-pick-zone.zone-left {
+  grid-area: 2 / 1;
+}
+.pane-pick-zone.zone-stack {
+  grid-area: 2 / 2;
+}
+.pane-pick-zone.zone-right {
+  grid-area: 2 / 3;
+}
+.pane-pick-zone.zone-bottom {
+  grid-area: 3 / 2;
+}
+.pane-pick-glyph {
+  pointer-events: none;
+}
+
+/* The scrim takes the tap that means "never mind". Below the tiles' pick overlays (7) so
+   it never intercepts a target, above the tiles themselves so a tap anywhere else cancels.
+   The chooser's scrim is the same element doing a slightly different job: there are no
+   targets on the tiles to protect, but a click that reached a pane would move the focus,
+   which is the one thing that mode promises not to do before Enter. */
+.pane-pick-scrim,
+.pane-chooser-scrim {
+  /* Absolute against .workspace, not fixed against the viewport. Fixed put it under the
+     sticky app bar (z-index 50) and let it intercept taps on the nav, so leaving the
+     screen took two taps. */
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  background: transparent;
+}
+/* The hint says what the workspace is waiting for, and it is a SIBLING of the scrim rather
+   than its content: it has to outrank the tiles' pick overlays (7), and a child cannot
+   climb out of a positioned parent's stacking context — inside the scrim (3) it was tinted
+   over by the candidate tile beneath it. Nothing to press, so the taps it covers pass
+   through to whatever the mode put there. */
+.pane-pick-hint {
+  position: absolute;
+  top: var(--space-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  max-width: calc(100% - var(--space-8));
+  pointer-events: none;
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+  color: var(--fg);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+/* The keyboard route, in the same pill as the question rather than a second banner: it is
+   an aside to the instruction, not another instruction. Its own line and muted, so the
+   question still reads first and the pill's width is set by whichever line is longer — no
+   breakpoint needed, which matters because the sheet keeps exactly one and this pill is
+   over a tile whose width has nothing to do with the viewport's. */
+.pane-pick-keys {
+  display: block;
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+/* THE PANE CHOOSER — tmux's "choose from a list", with the list in the corner and the
+   walking done on the workspace itself. Anchored to a CORNER rather than centred, and that is
+   the load-bearing decision: the arrows move a highlight around the tiles, so the list must
+   never be the thing the eye is on, nor cover the tiles it is reporting about. A centred
+   dialog would sit exactly where the middle of a split usually is.
+
+   WHICH corner is decided in JS (`chooserAnchor` in tiling/gutter.ts) and arrives as a class,
+   not as `inset-inline-start`. The logical property follows the document's COMPUTED direction,
+   and this app never sets `dir` — so a browser set to Arabic would render ltr and put the
+   floating panel opposite the gutter the same preference asks for. One rule has to decide
+   both, and the rule reads the language rather than the stylesheet. */
+.pane-chooser {
+  position: absolute;
+  top: var(--space-4);
+  /* Over the tiles' own overlays (7), like the pick hint, and over its scrim (3). */
+  z-index: 8;
+  width: min(22rem, calc(100% - var(--space-8)));
+  /* However many panes there are, the list stops well short of the tiles below it: it is a
+     readout, and a readout that fills the screen has become the subject. */
+  max-height: min(60%, 24rem);
+  /* A column with ONE scrolling part. The panel used to scroll as a whole, which was fine
+     while it was nothing but rows; with a map at the top and the key hint at the bottom, the
+     two things that describe the list would scroll out of it. `overflow: hidden` here and
+     `auto` on the rows alone. */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-sm);
+}
+/* The corner it hangs in. Exactly one of these is always set, so the panel is never left
+   without a horizontal anchor; the pinned rule below turns both off, because a flex item in a
+   gutter is placed by the line it sits in rather than by an inset. */
+.pane-chooser.left {
+  left: var(--space-4);
+}
+.pane-chooser.right {
+  right: var(--space-4);
+}
+/* Focus lives on the panel (it holds aria-activedescendant), so `--focus-ring` would box
+   the entire floating card — which says "the keyboard is somewhere in here", the one thing
+   nobody needed telling. The selected ROW is what says where the keyboard is, and it says
+   it in the place the answer will come from. Suppressed on purpose. */
+.pane-chooser:focus {
+  outline: none;
+  box-shadow: var(--shadow-md);
+}
+/* PINNED: the same panel, standing in the gutter its host just made. Everything that changes
+   here is a consequence of it no longer floating — it is in flow, it is as tall as the
+   workspace, and it casts no shadow because there is nothing under it to cast one onto.
+   What keeps it above the scrim is the z-index it already had (8, against the scrim's 3), and
+   `position: relative` is there only to make that z-index apply by the ordinary rule. Measured,
+   the panel outranks the scrim even when static — a flex item's z-index creates a stacking
+   context whether or not it is positioned, which is a special case of the flexbox spec and not
+   something a reader of this rule should have to know. So the line is deliberately redundant
+   TODAY and stops being redundant the moment .workspace is anything but a flex container. */
+.pane-chooser.pinned {
+  position: relative;
+  top: auto;
+  left: auto;
+  right: auto;
+  flex: 0 0 22rem;
+  width: 22rem;
+  max-height: none;
+  box-shadow: none;
+}
+/* While a PLACEMENT is armed, the standing panel is scenery rather than a control: the pick's
+   scrim covers the workspace and means "anywhere but a target is never mind", and a gutter
+   sitting above it with pressable rows would be the one place on screen where that is untrue.
+   `pointer-events` rather than a lower z-index so the click lands on the scrim underneath and
+   cancels, which is what pressing anywhere else already does. */
+.pane-chooser.pinned.inert {
+  pointer-events: none;
+}
+/* The title and the pin share a line. `baseline` so the glyph sits on the title's baseline
+   rather than being centred against a box that is mostly leading. */
+.pane-chooser-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+/* THE PIN. Faded until it is on: its off state is the app's normal state, so it has to be
+   quiet enough to sit in the corner of a panel nobody opened to look at it — and its on state
+   has to be unmistakable, because it is the only thing on screen that explains where a strip
+   of the workspace went. Opacity does the fading rather than `color`, since the glyph is an
+   emoji and paints its own. */
+.pane-chooser-pin {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 2px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  opacity: 0.4;
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+.pane-chooser-pin:hover {
+  opacity: 0.75;
+}
+.pane-chooser-pin.pinned {
+  opacity: 1;
+}
+.pane-chooser-title {
+  /* The head owns the space under this line — the title is one of two things on it. */
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0 var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* The scrolling part. `min-height: 0` because a flex item's default `min-height: auto` refuses
+   to shrink below its content, which would push the key hint off the bottom of the panel
+   instead of scrolling the rows — the classic flexbox failure, and it looks exactly like the
+   overflow rule not working.
+
+   Once this scrolls, something has to MOVE it: the walk changes which row is marked and nothing
+   about that touches a scroll offset, so on a workspace with more panes than the panel's
+   max-height admits, the mark travels out of the box and the panel reports a position nobody can
+   see. `revealRow` (views/tiling/reveal.ts), driven off the marked row in PaneChooser, is what
+   keeps it in view. Nothing here can do it — CSS has no selector for "the scrolled-out one". */
+.pane-chooser-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* THE MINI MAP — the workspace drawn small. Its job is the one thing the list cannot do: say
+   WHERE a pane is. Under the extending layout the workspace can be several screens wide, and
+   a list is ordered but not positioned; "row 5 of 7" is not an answer to "where".
+
+   Sized inline, in rem, by `minimap.ts` rather than here: the box has to keep the workspace's
+   real proportions while fitting two budgets at once, and `aspect-ratio` cannot — with a
+   `max-height` capping it, the ratio is the constraint CSS drops. The numbers are computed
+   where they can be tested. */
+.pane-chooser-map {
+  position: relative;
+  align-self: center;
+  flex: 0 0 auto;
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg2);
+  /* The tiles are placed in percentages of this box, so a rounding overhang at the far edge
+     must be clipped rather than allowed to widen the panel. */
+  overflow: hidden;
+  /* IN REM, NOT `--text-xs`, and this is load-bearing. `minimap.ts` decides how many number
+     bullets a cell can hold from arithmetic alone — a cell is a fraction of a box whose size
+     is known in rem — and that only works if the bullet is a known number of rem too. The
+     token is 12px, so 0.75rem is the same size at the default root font and, unlike the token,
+     stays in step with the box when the root font is scaled. Change this back to a px value
+     and cells will silently overflow instead of eliding. */
+  font-size: 0.75rem;
+}
+/* A tile. `inset`-free absolute placement in percentages of the map, straight from
+   `tileRects` — the same numbers the arrow keys walk, so the picture cannot disagree with
+   where a direction goes. The 1px border doubles as the gap between neighbours: two adjacent
+   tiles put their borders side by side, which reads as the divider it stands for. */
+.pane-chooser-map-tile {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* A stack draws ALL of its numbers, so this is a GRID of them — wrapped, because a cell is
+     as tall as its tile and a single line would elide while leaving that height empty. The
+     rows are centred as a block so a part-filled last line sits under the ones above it rather
+     than against the bottom edge. `bulletGrid` in minimap.ts counts the same rows and columns
+     this lays out; the gap here is BULLET_GAP_REM there, and the two must agree. */
+  flex-wrap: wrap;
+  align-content: center;
+  gap: 0.15rem;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+/* The bullets are their own click targets — the only way to reach a background tab by pointing
+   at it, since stacked tabs share one place on screen and the cell as a whole stands for just
+   the visible one. `inherit` so the map's rem font reaches them: `.pane-number` sets `--text-xs`
+   itself, and a px bullet inside a rem box breaks the fitting arithmetic. */
+.pane-chooser-map .pane-number {
+  font-size: inherit;
+  cursor: pointer;
+}
+/* Where the WALK is, inside a cell that may hold several numbers. Same treatment the list's
+   selected row gives its circle, and `:not(.current)` for the same reason: the filled form
+   must win when a pane is both, and it could not on specificity alone. */
+.pane-chooser-map .pane-number.selected:not(.current) {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+/* What was cut off. NOT drawn as a bullet: it stands for numbers rather than being one, and a
+   circled ellipsis would read as a pane that exists. */
+.pane-chooser-map-more {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  line-height: 1;
+}
+/* Where the walk has got to — the same accent fill the previewed tile and its row already
+   wear, so all three halves of the highlight are visibly one thing. */
+.pane-chooser-map-tile.current {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+/* No `.disabled` anywhere in the map: refusals belong to a caller's question, and a caller's
+   question is drawn as a list with no picture (see `asking` in PaneChooser). */
+.pane-chooser-map-tile:hover {
+  border-color: var(--accent-border);
+}
+/* WHAT IS ON SCREEN — the only place in the app that says how much of the workspace the user
+   is looking at. An outline rather than a fill, because everything it covers must stay
+   readable: it frames the tiles, it does not tint them. `pointer-events: none` so the tiles
+   under it remain clickable — the rectangle is a readout, not a target. */
+.pane-chooser-map-view {
+  position: absolute;
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  border-radius: 3px;
+  /* Drawn inside its own rectangle rather than centred on it, so that at scroll offset 0 the
+     frame sits flush against the map's edge instead of half outside it. */
+  box-sizing: border-box;
+}
+/* One group per TILE, because a tile is what a direction key moves to: the rows inside a
+   group share a place on screen, and the group's rule is the only thing that says so. */
+.pane-chooser-tile + .pane-chooser-tile {
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+  padding-top: 2px;
+}
+.pane-chooser-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-1);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.pane-chooser-item:hover {
+  background: var(--bg2);
+}
+/* Where the walk has got to. The same accent fill the previewed TILE wears, so the two
+   halves of the highlight are visibly one thing. */
+.pane-chooser-item.selected {
+  background: var(--accent-subtle);
+  color: var(--fg);
+}
+/* The chooser lists panes with `ctx.tabTitle`, so each row holds the very markup a tab
+   holds — the name and, for a terminal, its activity badge. It is therefore laid out the
+   same way and for the same reason: this was a shrinking, clipping flex item with the badge
+   sitting after the name, which is the arrangement that hid the badge in the tab bar. The
+   name is the only child that gives way; the badge's own dimensions come from the rule it
+   shares with the tab, so the two cannot drift apart.
+
+   The truncation moved onto `.tab-name`, which every tabTitle now returns. The one row that
+   is NOT a pane — the "an arbitrary location" escape — puts a bare string here instead, and
+   bare text in a flex container cannot ellipsis. That label is a fixed short constant, so
+   it has nothing to truncate. */
+.pane-chooser-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+/* A pane this choose cannot land on — the source folder of a transfer, an editor pane, the
+   mount list. It STAYS in the list and stays walkable, because the walk is spatial: a row
+   removed from between two others would move every tile's number and break the one thing
+   that ties a row to a place on screen. Greyed exactly as a disabled palette row is, with
+   the reason spelled out beside it rather than left to be guessed at. */
+.pane-chooser-item.disabled {
+  cursor: default;
+}
+.pane-chooser-item.disabled .pane-chooser-label {
+  color: var(--fg-muted);
+}
+.pane-chooser-why {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+/* The answer that is not a pane — "an arbitrary location", for a transfer. A rule above it
+   rather than a place in the list, because it has no tile, no number and no position in the
+   walk: it is what you take INSTEAD of any of these, and it reads that way. */
+.pane-chooser-other {
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+.pane-chooser-other .pane-chooser-label {
+  font-family: var(--font-sans);
+  font-style: italic;
+}
+/* THE PANE NUMBER, drawn as a circle rather than typed as one. The Unicode circled digits
+   (U+2460…) are out: they stop at 20, they are missing from a good many monospace faces (so
+   the browser silently substitutes a face that has them and the digit no longer matches the
+   text beside it), their weight and size cannot be tuned against the surrounding type, and
+   they cannot take the accent when the row is selected. A digit in a round box is the same
+   glyph everywhere and is styled like everything else here.
+   Square box + 50% radius, sized in `em` so one rule serves the tab badge and the big plate:
+   `aspect-ratio` would be at the mercy of the digit's advance width, and a "circle" that is
+   an ellipse on 1 and a circle on 8 is worse than no circle. */
+.pane-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.6em;
+  height: 1.6em;
+  border: 1px solid var(--accent-border);
+  border-radius: 50%;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1;
+  /* Two digits must not make the circle wider than it is tall. */
+  font-variant-numeric: tabular-nums;
+}
+/* The walk's row lifts its circle off the tinted background. `:not(.current)` because the
+   filled form below must win when a row is both, and it could not on specificity — this
+   selector is (0,3,0) against its (0,2,0), so source order would never get a look in. */
+.pane-chooser-item.selected .pane-number:not(.current) {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+/* WHERE THE FOCUS IS, said by inverting the circle rather than by a second mark beside it.
+   The list used to carry a ● in a column of its own, which cost every row that column's
+   width and drew two things for one fact; filling the number in says it in the glyph that is
+   already there, and it works in the two places a dot had nowhere to go — the tab bar and
+   the plate. A pane that is both the focused one and the one the walk is on reads as filled:
+   the walk is where you MIGHT go, and "you are already here" is the more useful of the two. */
+.pane-number.current {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+/* THE TAB BADGE MUST NOT CHANGE THE BAR'S HEIGHT. Same constraint the activity badge above
+   is measured against, and the same reason: the bar sets the tile's body offset, so a bar
+   that grows when the chooser opens makes every pane's content jump — and the chooser's own
+   job is to let you look at the panes. The badge at the base size was 19px against a line box
+   of 18.59px and cost 1.4px; at 0.8em it is 15px, which fits inside it with room to spare.
+   `vertical-align: middle` keeps an inline-flex box from putting its own baseline into the
+   line-box calculation. Measured in a browser, not reasoned about: 27.59px with the numbers
+   on and off, on both workspaces. */
+.pane-number-tab {
+  font-size: 0.8em;
+  vertical-align: middle;
+}
+/* "needs you" is the only badge in the app that is a REQUEST rather than a report. Every
+   other one states what something IS — running, degraded, read-only — and is read when the
+   eye arrives. This one is the reason to look at all, and it is often on a background tab
+   in a tile nobody is watching, next to a "working" badge of the same size and family. A
+   static fill cannot distinguish "here is a fact about this pane" from "this pane is
+   waiting for you"; a slow recurring swing of the fill can, because peripheral vision
+   answers movement without being pointed at it.
+   It is a SWEEP, not a fill that brightens and dims: the only thing that moves is where
+   the gradient's colour stops sit. The band's colours are identical in both keyframes and
+   only the three stop positions travel, from entirely off the left edge to entirely off
+   the right — which is what makes the loop seamless without `alternate`, since the band is
+   absent at both ends of the cycle and there is nothing to snap back. The badge holds still
+   for the first 40% of each cycle so it reads as an occasional glint rather than a
+   barber's pole.
+
+   Only `background-image` is animated. The flat `--warn-subtle` from `.badge.warn` stays
+   underneath and shows through the transparent parts, so the badge never loses its resting
+   colour; the band adds to it rather than replacing it. Nothing about the box changes, so
+   it neither reflows nor draws the eye by size, and the text stays readable throughout. */
+/* THE STOP POSITION IS AN ANIMATED CUSTOM PROPERTY, and it has to be a REGISTERED one.
+   `background-image` has animation type DISCRETE: no browser interpolates between two
+   `linear-gradient()` values, so keyframing the gradient itself does not sweep — it flips
+   from one frame to the other at a single instant. The first version of this did exactly
+   that, and because both of its frames put the band outside the 0-100% box (which is what
+   made the loop seamless), the band was never once drawn inside the badge. It looked like
+   nothing at all.
+   An UNREGISTERED custom property fails the same way, being a token rather than a value.
+   Registering `--attn-stop` as a <percentage> is what makes it interpolable, so the browser
+   recomputes the gradient every frame and the stops genuinely travel. */
+@property --attn-stop {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: -22%;
+}
+.badge.attention {
+  background-image: linear-gradient(
+    100deg,
+    transparent calc(var(--attn-stop) - 22%),
+    var(--warn-strong) var(--attn-stop),
+    transparent calc(var(--attn-stop) + 22%)
+  );
+  animation: badge-attention 2.4s linear infinite;
+}
+@keyframes badge-attention {
+  0%,
+  40% {
+    --attn-stop: -22%;
+  }
+  100% {
+    --attn-stop: 122%;
+  }
+}
+/* Reduced motion keeps the EMPHASIS and drops the movement: the stronger fill is what the
+   pulse was there to say, so pinning the far end leaves the badge louder than its
+   neighbours without anything moving. Pinning the resting end would silently downgrade
+   this back to an ordinary warn badge for the people who asked for less motion. */
+/* The pane's NUMBER carries the same alarm, and carries it INVERTED. The number is how a
+   pane is addressed — `prefix s` then a digit — so when the answer to "which one needs me?"
+   is a number, that number is the thing worth lighting up. It is also seen more widely than
+   the badge: the badge lives in the tab bar, while the number appears in the chooser's list,
+   which is exactly what someone opens when several panes are running.
+
+   Inverted rather than tinted like the badge, and the two are not meant to match. A badge is
+   a word on a wash and reads as a label; a number is a glyph in a circle, and at 1.6em of
+   --text-xs a wash behind it is barely a colour at all. Filling the disc is what the circle
+   already does to say something about itself (see .pane-number.current), so this says its
+   thing in the vocabulary the element has.
+
+   REGARDLESS OF WHETHER THE PANE IS ACTIVE. This out-specifies .pane-number.current and
+   takes its accent fill, deliberately: current is a fact about where you are, and a pane
+   waiting on a human is a request. Where the focus is stays written on the tab
+   (.tab.active) and around the tile (.stack.focused), so nothing is lost by letting the
+   circle answer the louder question.
+
+   Keyed off the BADGE with :has() rather than off a flag threaded down from the host. The
+   badge's presence IS the state, so the two cannot disagree, and the tiling chrome — which
+   draws the number and knows nothing of sessions — needs no new input. The two carry
+   DIFFERENT animations on purpose (see the keyframes below): a badge is wide enough for a
+   band to travel across, a 1.6em disc is not.
+
+   The big display-panes plate is left out. It shows one number per TILE — the active tab's
+   — while the badge may belong to a background tab of that tile, so a :has() on .stack
+   would light the wrong digit. */
+.tab:has(.badge.attention) .pane-number,
+.pane-chooser-item:has(.badge.attention) .pane-number {
+  border-color: transparent;
+  background: var(--warn);
+  color: var(--warn-fg);
+  animation: pane-number-attention 2.4s ease-in-out infinite;
+}
+/* A plain brightness breathe, not the badge's sweep, and the difference is the point. A
+   gradient band crossing a 1.6em disc is a smear rather than a movement — there is not
+   enough width for a travelling edge to read as travelling — whereas a whole disc changing
+   value is unmistakable at that size.
+
+   THE SAME 2.4s AS THE BADGE, stated as the same number. It used to be `1.2s alternate`,
+   which is also a 2.4s round trip — but a duration that has to be doubled in your head to
+   be compared is a duration that will be changed on one side and not the other. Going out
+   and back within one period says it in the keyframes instead, where it is checkable.
+   Only `background-color`, so nothing about the circle moves. */
+@keyframes pane-number-attention {
+  0%,
+  100% {
+    background-color: var(--warn);
+  }
+  50% {
+    background-color: var(--warn-deep);
+  }
+}
+/* Motion off, emphasis kept. The badge needs its far-end wash pinned because the wash was
+   the animation; the number does not — its fill is a solid it already has, so stopping the
+   sweep leaves the inverted disc exactly as loud as it was. */
+@media (prefers-reduced-motion: reduce) {
+  .badge.attention,
+  .tab:has(.badge.attention) .pane-number,
+  .pane-chooser-item:has(.badge.attention) .pane-number {
+    animation: none;
+  }
+  .badge.attention {
+    background: var(--warn-strong);
+  }
+}
+
+/* tmux's display-panes: big enough to read from the far side of the workspace, which is the
+   whole job — it is how a row in the corner and a tile over there become the same thing. */
+.pane-number-plate {
+  position: absolute;
+  inset: 0;
+  z-index: 6; /* over the previewed tile's tint (4), under the pick overlay (7) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Nothing to press: the tap belongs to the scrim underneath, which cancels. */
+  pointer-events: none;
+}
+.pane-number-big {
+  /* The top of the type scale, not a literal — 1.6em of it is a 38px disc, which reads
+     across a workspace without becoming the thing you look at. */
+  font-size: var(--text-2xl);
+  /* NO RING. At badge size the border is what makes a circle out of a digit; at this size
+     the FILL already is one, and the ring then reads as a second edge just inside the disc's
+     own — fussy at exactly the size where nothing needs help being seen. The shadow stays:
+     it is what lifts the disc off the pane's content, which a ring never did. */
+  border: none;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+  opacity: 0.95;
+}
+/* The keyboard route, muted and last, exactly as in the pick hint's pill. */
+.pane-chooser-keys {
+  margin: var(--space-1) 0 0;
+  padding: 0 var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+.pane-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Breadcrumb navigation living in a pane's sub-header row: single line, clipped rather
+   than wrapped, so the header height stays fixed. Left-aligned while it fits; when the
+   path overflows, PaneCrumbs scrolls it to the end (keeping the current, deepest
+   folder visible) and adds .is-clipped, which fades the clipped ancestors on the LEFT
+   — a left-side ellipsis that, unlike text-overflow, works across the separate crumb
+   links. */
+.stack-subheader .crumbs {
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  /* Same slack, same reason, as .appbar-nav: the overflow:hidden that makes the left fade
+     possible also clips the focus ring off a crumb, and the lane is exactly as tall as the
+     crumb text. The margin cancels the padding on both axes, so the box covers the same
+     region it always did — the trail starts where it did and the sub-header does not grow
+     — while the ring now has somewhere to land inside the clip. */
+  padding: 3px var(--space-1);
+  margin: -3px calc(-1 * var(--space-1));
+}
+.stack-subheader .crumbs.is-clipped {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 2rem);
+  mask-image: linear-gradient(to right, transparent, #000 2rem);
+}
+.stack-subheader .crumbs a {
+  white-space: nowrap;
+}
+.pane-close,
+.pane-refresh {
+  flex: 0 0 auto;
+  height: 20px;
+  padding: 0 var(--space-2);
+  line-height: 1;
+}
+/* The stack body holds every pane of the stack absolutely stacked; the chrome shows
+   only the active one (display:none the rest) so background tabs stay mounted. */
+.stack-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+}
+.stack-pane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+/* The terminal's drop layer: the element that takes a file drop and lands it in the
+   directory the shell reports. It wraps the terminal without changing its geometry — it
+   takes exactly the tile the terminal was going to fill, so .term-wrap's own inset:0 still
+   resolves to the same rect — and it is what the .fs-drop-here ring is drawn on, the same
+   ring a file pane shows for the same gesture. */
+.term-drop {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.stack-pane .term-drop {
+  position: absolute;
+  inset: 0;
+}
+
+/* Inside a pane the terminal fills the body instead of the standalone framed box. */
+.stack-pane .term-wrap {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  padding: var(--space-1);
+}
+
+/* A file-explorer pane fills its tile as a column: the listing scrolls internally so
+   the pane itself never scrolls. An editor pane fills the same way. */
+.stack-pane .file-pane,
+.stack-pane .file-editor {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+/* The editor bar keeps its own inset since the pane itself no longer pads its body.
+   (The browse pane's status line is gone: those messages go to the global toaster, so
+   nothing reflows the listing you are looking at.) It sits atop the editor pane,
+   separated from the editor below it, and is deliberately built to the same metrics as
+   the browse pane's breadcrumb sub-header (.stack-subheader): same padding, gap, xs
+   type, 18px controls, --bg2 fill and bottom rule, so the two lanes line up and read as
+   one band when an editor is split beside a file explorer. Hence nowrap — a wrapping bar
+   would grow past the sub-header's fixed height; the trailing status text ellipsises
+   instead. */
+.file-pane-editor-bar {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  min-width: 0;
+  font-size: var(--text-xs);
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+.file-pane-editor-bar button {
+  flex: 0 0 auto;
+  height: 18px;
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+  line-height: 1;
+}
+/* The badge carries its own padding/leading; trim both so it stays inside the 18px lane
+   instead of setting the bar's height itself. margin-left:auto parks it at the far right
+   of the bar, away from the controls, so appearing/disappearing shifts nothing. */
+.file-pane-editor-bar .badge {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 var(--space-2);
+  line-height: 16px;
+}
+.file-pane-editor-bar .muted {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* The listing fills the pane flush to its frame: the pane's own border is the outer
+   edge, so the list drops its border/radius and there is no surrounding padding. */
+.file-pane .fs-list {
+  flex: 1 1 auto;
+  min-height: 3rem;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+}
+.file-editor .editor-wrap {
+  flex: 1 1 auto;
+  min-height: 6rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+}
+.file-editor .editor-wrap .cm-editor {
+  max-height: none;
+  height: 100%;
+  /* The pane's zoom, and the only thing in an editor pane that takes it: the toolbar above
+     keeps its size, because a Save button that grew with the text would be a control walking
+     away from the finger reaching for it. CodeMirror sizes its gutter and its line height off
+     this, so the document re-flows properly rather than being scaled.
+     --text-base is what it inherited from `body` before the variable existed, so an unzoomed
+     editor renders through exactly the declarations it always did. */
+  font-size: calc(var(--text-base) * var(--pane-zoom, 1));
+}
+
+/* Tiny image viewer: the image is centered and fit within the tile, and scrolls once it is
+   zoomed past it.
+   The centering is AUTO MARGINS on the image, not `align-items`/`justify-content` here, and
+   that is load-bearing rather than a style choice: a flex item centred by the container and
+   then overflowed is clipped at its top and left UNREACHABLY, because a scroll container
+   cannot scroll to a negative offset. Auto margins centre identically while the image fits
+   and collapse to zero once it does not, so every corner of a zoomed image can be panned to.
+   (https://drafts.csswg.org/css-flexbox/#auto-margins — the standard workaround.) */
+.stack-pane .image-viewer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  overflow: auto;
+  padding: var(--space-2);
+  min-height: 0;
+}
+.image-viewer-img {
+  /* An image has no font to grow, so its zoom is the real thing: the box grows and the
+     container above scrolls. At --pane-zoom 1 this is the plain `100%` it has always been. */
+  max-width: calc(100% * var(--pane-zoom, 1));
+  max-height: calc(100% * var(--pane-zoom, 1));
+  object-fit: contain;
+  margin: auto;
+}
+
+.pane-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  align-items: flex-start;
+}
+.pane-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  align-items: flex-start;
+}
+
+/* Edge-split overlays: resting on a tile edge reveals a highlighted bar previewing where
+   a new pane will go; clicking splits toward that edge. Invisible the rest of the time so
+   the terminal underneath stays unobstructed.
+
+   `.armed` — set on exactly ONE zone by the tile's hover-intent dwell (panes.tsx,
+   SPLIT_ARM_DELAY_MS) — is the whole visibility rule. Deliberately NOT `:hover`: the
+   dwell ends with the pointer standing still, and hover state is only recomputed on the
+   next pointer move, so a `:hover` rule would leave the bar hidden until the user
+   jiggled the mouse. The matching `pointer-events` is set INLINE by panes.tsx, not here,
+   so the click-through state cannot drift from the signal that gates the handler. */
+.pane-split-zone {
+  position: absolute;
+  z-index: 5;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  /* Reset the global `button { height: var(--control-h) }`: without this the
+     left/right zones (sized by top:0/bottom:0, no explicit height) are
+     over-constrained, so `bottom` is dropped and they collapse to a short button
+     pinned at the top — leaving most of the side edge with no hotzone. */
+  height: auto;
+  min-height: 0;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--transition);
+}
+.pane-split-zone.armed {
+  opacity: 1;
+}
+/* THE TOUCH GESTURE'S TWO HALVES (see SPLIT_HOLD_MS in panes.tsx). A finger cannot hover, so
+   the bar is charged by holding on it and spent by touching it again; these two rules are
+   the only thing that tells the user any of that is happening.
+
+   `charging` re-uses the base rule's opacity transition and only lengthens it — the duration
+   comes in INLINE from the ramp the press is on, so the motion the eye follows and the timer
+   the state is running are one number. Linear on purpose: going up is progress towards a
+   known end, and the glow arriving at full strength IS "you may let go now". */
+.pane-split-zone.charging {
+  opacity: 1;
+  transition-timing-function: linear;
+}
+/* …and `cooling` is the same statement in reverse, over SPLIT_HOT_MS (also inline): the bar
+   stays live for exactly as long as it is visibly lit, so the deadline needs no explaining.
+   Placed AFTER `.armed` deliberately — same specificity, so source order is what lets a
+   cooling bar fade while it is still armed.
+
+   LINEAR, AND THAT IS THE WHOLE DESIGN: the bar dims at one constant rate, so its brightness
+   IS the heat — the fraction of the window still to run — as a direct one-to-one readout with
+   nothing between them. Half lit means half the time left, at every moment and from every
+   starting point.
+
+   It was eased for a while, and every version of that was wrong in a different way. Held back
+   gently the early fade still ran faster than the late one; held back hard (an exponential
+   ease-in) the bar sat at 99% for four seconds of a ten-second window and every visible frame
+   piled into the drop at the end, which reads as FASTER, not slower. Worse, an eased curve
+   makes the rate depend on where the fade STARTED: a bar re-heated to a third runs the same
+   easing compressed into a third of the time, so the same brightness drains at a different
+   speed depending on history. Linear is the only shape with no such memory.
+
+   The window carries the "not urgent yet" that the easing was reaching for — ten seconds of
+   linear fade dims by a tenth per second, which is unhurried by construction. Shape and
+   duration are separate jobs, and the duration was the one that needed doing.
+
+   A TRANSITION rather than an animation, and that is load-bearing: a transition interpolates
+   from the value the element is CURRENTLY showing, so re-holding a half-faded bar reverses it
+   in place from exactly the brightness the user is looking at. An animation would restart
+   from its own `from` keyframe and jump. */
+.pane-split-zone.cooling {
+  opacity: 0;
+  transition-timing-function: linear;
+}
+/* NO prefers-reduced-motion override for these two, deliberately. There was one, and it made
+   both stages instant steps — which on a machine with the setting on is precisely the report
+   this gesture kept getting: "it cools down as fast as it heats up". These fades are not
+   motion in the sense the setting is about (nothing moves, scales or parallaxes); they are a
+   slow opacity change that IS the affordance, carrying how much of the window is left. Taking
+   it away does not calm the interface down, it removes the only thing that says the bar is on
+   a deadline at all. */
+.pane-split-zone:focus-visible {
+  outline: none;
+}
+/* Only which EDGE each strip hugs is here. Its thickness across that edge and its extent
+   along it are both set inline from SPLIT_EDGES / EDGE_INSET in panes.tsx, because those
+   are the same two numbers `edgeAt()` arms on: a strip that is live somewhere it is not
+   drawn — or drawn where it is not live — is the bug this gate exists to prevent. Since
+   EDGE_INSET the strips no longer meet at the corners, so nothing has to win them, and
+   each one covers exactly the purple bar it draws. */
+.pane-split-zone.edge-top {
+  top: 0;
+}
+.pane-split-zone.edge-bottom {
+  bottom: 0;
+}
+.pane-split-zone.edge-left {
+  left: 0;
+}
+.pane-split-zone.edge-right {
+  right: 0;
+}
+.pane-split-zone.edge-top.armed {
+  background: linear-gradient(to bottom, var(--accent-subtle), transparent);
+}
+.pane-split-zone.edge-bottom.armed {
+  background: linear-gradient(to top, var(--accent-subtle), transparent);
+}
+.pane-split-zone.edge-left.armed {
+  background: linear-gradient(to right, var(--accent-subtle), transparent);
+}
+.pane-split-zone.edge-right.armed {
+  background: linear-gradient(to left, var(--accent-subtle), transparent);
+}
+/* The highlighted bar itself, hugging the hovered edge. */
+.pane-split-bar {
+  position: absolute;
+  background: var(--accent);
+  border-radius: var(--radius-sm);
+}
+/* The bar FILLS its strip on the long axis: the strip is already inset to the bar's old
+   15%, and insetting again would shrink the ink to 70% of the hotzone. */
+.pane-split-zone.edge-top .pane-split-bar,
+.pane-split-zone.edge-bottom .pane-split-bar {
+  left: 0;
+  right: 0;
+  height: 4px;
+}
+.pane-split-zone.edge-top .pane-split-bar {
+  top: 3px;
+}
+.pane-split-zone.edge-bottom .pane-split-bar {
+  bottom: 3px;
+}
+.pane-split-zone.edge-left .pane-split-bar,
+.pane-split-zone.edge-right .pane-split-bar {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+.pane-split-zone.edge-left .pane-split-bar {
+  left: 3px;
+}
+.pane-split-zone.edge-right .pane-split-bar {
+  right: 3px;
+}
+
+/* --- App-wide command palette (prefix then ">") --------------------------- */
+.cmd-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.35);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  z-index: 100;
+}
+.cmd-palette {
+  width: min(480px, 92%);
+  display: flex;
+  flex-direction: column;
+  max-height: 70vh;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2);
+  outline: none;
+}
+.cmd-filter {
+  width: 100%;
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  color: var(--fg);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.cmd-filter:focus {
+  outline: none;
+  border-color: var(--accent-border);
+}
+.cmd-list {
+  overflow-y: auto;
+  min-height: 0;
+}
+.cmd-group {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  padding: var(--space-2) var(--space-2) var(--space-1);
+}
+.cmd-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+.cmd-item.selected,
+.cmd-item:hover,
+.cmd-item:focus-visible {
+  background: var(--accent-subtle);
+}
+.cmd-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A command that is offered but cannot run yet. It keeps its selection highlight — it is
+   still the row the keyboard is on — and loses only the contrast that says "press me", so
+   the list does not develop holes as the workspace changes shape. The reason beside it is
+   what stops the grey from being a riddle. */
+.cmd-item.disabled .cmd-item-title {
+  color: var(--fg-muted);
+}
+.cmd-item.disabled {
+  cursor: default;
+}
+.cmd-item-why {
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+/* A command may advertise more than one key (Files' cross-pane copy answers to
+   Ctrl+Shift+C and to F5). They are separate caps rather than one "Ctrl+Shift+C / F5"
+   string, so each reads as a key you could press, and the gap is what keeps two caps
+   from looking like one chord. */
+.cmd-item kbd + kbd {
+  margin-left: var(--space-1);
+}
+/* A key that needs NO prefix, standing in a column where every other cap has meant "after
+   the prefix". Marked in the accent rather than by a glyph or a suffix: it is one cap's
+   worth of space, and a "!" beside it would be a second thing to learn. The tooltip on the
+   element is what says it in words. */
+.cmd-item kbd.direct {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cmd-item kbd {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  min-width: 20px;
+  text-align: center;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+  background: var(--bg2);
+}
+.cmd-empty {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  padding: var(--space-3) var(--space-2);
+}
+.cmd-hint {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  padding: var(--space-2) var(--space-2) var(--space-1);
+}
+
+/* App modal: a small centered dialog for text prompts, confirms, and choices (e.g.
+   pane placement). Shares the command palette's backdrop but is vertically centered. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(16, 24, 40, 0.35);
+}
+.modal-panel {
+  width: min(420px, 92%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-4);
+  outline: none;
+}
+.modal-title {
+  margin: 0 0 var(--space-3);
+  font-weight: var(--fw-medium);
+}
+.modal-message {
+  margin: 0 0 var(--space-3);
+  color: var(--fg-dim);
+}
+.modal-label {
+  display: block;
+  margin-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.modal-input {
+  width: 100%;
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+  color: var(--fg);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.modal-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+/* Choice variant: side-by-side big buttons. */
+.modal-choice {
+  outline: none;
+}
+.modal-options {
+  display: flex;
+  gap: var(--space-3);
+}
+.modal-option {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-2);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+/* The MENU form of a choice: one option per row, glyph beside label. Used where the row
+   form would divide the panel into slivers — at six options a min(420px, 92%) panel gives
+   each tile about 50px, which is narrower than the word "Split". Deliberately a separate
+   layout rather than `flex-wrap` on the row form: `.modal-option` is `flex: 1 1 0`, so a
+   wrapped final row stretches to full width and an odd option count ends in one giant
+   orphan tile — a layout whose shape changes when someone adds a seventh action. */
+.modal-options.list {
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.modal-options.list .modal-option {
+  flex: 0 0 auto;
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: var(--space-3);
+  /* Comfortably past the ~44px a fingertip needs, which is the reason this form exists. */
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+}
+.modal-options.list .modal-glyph {
+  /* A fixed column keeps every label starting at the same x, whatever the glyph's width
+     (the arrows and the box-drawing glyphs do not share an advance). */
+  flex: 0 0 1.25rem;
+  text-align: center;
+}
+.modal-option.focused,
+.modal-option:hover {
+  border-color: var(--accent-border);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+  background: var(--accent-subtle);
+}
+.modal-glyph {
+  font-size: var(--text-xl);
+  line-height: 1;
+}
+.modal-option-label {
+  font-size: var(--text-sm);
+}
+.modal-hint {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+/* Global "prefix armed" cue: shown on any screen while the prefix window is open. */
+.prefix-badge {
+  position: fixed;
+  bottom: var(--space-4);
+  right: var(--space-4);
+  z-index: 90;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: var(--fw-medium);
+  color: var(--accent);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2) var(--space-3);
+}
+.prefix-badge kbd {
+  font-family: var(--font-mono);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+  background: var(--accent-subtle);
+}
+
+/* --- Settings screen ------------------------------------------------------ */
+/* A settings group: a heading and its rows, full page measure, and no rule above
+   it. Not `.cards` — a setting is prose with a control on it, read top to bottom,
+   not a readout to scan beside its neighbours in a 260px grid cell. Not `.section`
+   either: that band's 2px rule separates unlike things (a project from a project,
+   Spec from Logs), whereas every group here holds the same kind of thing and the
+   heading already marks the boundary.
+   So the spacing carries the grouping alone, and it only works if the gap BETWEEN
+   groups clearly beats the gap inside one: --space-8 above a heading against the
+   --space-3 below it. Closing that ratio makes the last row of one group read as
+   the first row of the next. */
+.setting-group + .setting-group {
+  margin-top: var(--space-8);
+}
+.setting-group > h2 {
+  margin: 0 0 var(--space-3);
+}
+/* A grid and not a flex row so the checkbox column is RESERVED, not merely filled:
+   `.setting-text` is pinned to column 2, so a row whose control is a select rather
+   than a leading checkbox starts its title on the same line as every other row.
+   Under flex, such a row had nothing in front of it and hung ~21px left of the
+   checkbox rows' titles, which is the whole of what read as ragged. */
+.setting-row {
+  display: grid;
+  grid-template-columns: var(--space-4) 1fr;
+  column-gap: var(--space-2);
+  align-items: start;
+  cursor: pointer;
+}
+.setting-row + .setting-row {
+  margin-top: var(--space-4);
+}
+/* Not a setting and so not a `.setting-row` — see Settings.tsx — but it sits in the
+   same stack and has to line up with it, so it borrows the row's grid and nothing
+   else. The sibling rules restate the row gaps ACROSS it: without them the row after
+   a preview loses its top margin, because `.setting-row + .setting-row` no longer
+   matches once something is between them. */
+.setting-preview {
+  display: grid;
+  grid-template-columns: var(--space-4) 1fr;
+  column-gap: var(--space-2);
+  align-items: start;
+}
+.setting-row + .setting-preview,
+.setting-preview + .setting-row {
+  margin-top: var(--space-4);
+}
+/* A sub-setting rides the row above it. Same left edge — the grid already aligns
+   it with the parent's TEXT, which is where a continuation belongs — so all this
+   carries is the tighter gap that says "still the same setting". */
+.setting-sub {
+  margin-top: var(--space-2);
+}
+.setting-row input[type="checkbox"] {
+  width: auto;
+  height: auto;
+  min-height: 0;
+  margin: 2px 0 0;
+  cursor: pointer;
+}
+.setting-text {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.setting-title {
+  font-weight: var(--fw-medium);
+}
+/* A non-boolean control lives INSIDE the text column, after the description, so
+   every row reads in one order — name, what it does, then the control. The column
+   is `align-items: stretch`, which would run the select the full width of a
+   paragraph of description; `flex-start` sizes it to its own longest option. */
+.setting-text select {
+  align-self: flex-start;
+  margin-top: var(--space-1);
+}
+/* The terminal font sample. Deliberately dressed as a terminal and not as a code
+   block: dark ground and terminal foreground whatever the theme, and .term-wrap's
+   own border and radius, because what it is previewing is how a PANE will look and a
+   sample on the page's own background would be judged against the wrong contrast.
+
+   Note what is NOT set here: font-family, font-size and line-height are all inline,
+   from the three settings being previewed. The size in particular must not become a
+   token — it is the one number in the terminal that cannot be one (xterm measures its
+   cell from it and paints to a canvas that inherits no CSS), and a sample drawn at
+   --text-sm would be showing a size the terminal will not use. No wrapping either: a
+   terminal does not reflow a line, it scrolls, so a preview that wrapped would
+   misreport the measure. */
+.term-font-preview {
+  align-self: stretch;
+  margin: var(--space-1) 0 0;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: var(--space-3);
+  background: #000;
+  color: #e6e6e6;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  white-space: pre;
+}
+/* A list of paths, so monospace and the page's measure rather than the select's
+   own width. Resizes vertically only: horizontal resize would drag it out of the
+   grid column every other row is aligned to. */
+.setting-textarea {
+  align-self: stretch;
+  margin-top: var(--space-1);
+  max-width: 46ch;
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  resize: vertical;
+}
+
+svg.graph .node rect {
+  fill: var(--bg2);
+  stroke: var(--border);
+  stroke-width: 1.2;
+  rx: 8;
+}
+svg.graph .node.running rect {
+  stroke: var(--ok);
+}
+svg.graph .node text {
+  fill: var(--fg);
+  font-size: 13px;
+}
+svg.graph .node text.sub {
+  fill: var(--fg-dim);
+  font-size: 11px;
+}
+svg.graph .edge path {
+  stroke: var(--fg-dim);
+  fill: none;
+  stroke-width: 1.4;
+}
+svg.graph .edge text {
+  fill: var(--fg-dim);
+  font-size: 10px;
+}
+svg.graph .arrow {
+  fill: var(--fg-dim);
+}
+
+/* --- Metrics dashboard ---------------------------------------------------- */
+/* The filter row scopes everything below it, so it sits ABOVE the panels and
+   never inside one: a per-chart range control would let two panels describe two
+   different moments while looking like one dashboard. */
+/* A screen title carrying the one control that governs the whole screen — the
+   metrics scope, which decides which panels exist rather than which slice of them
+   is shown. That control cannot live in `.filters` beside the controls whose very
+   presence it decides; here it is above and outside them, which is the order a
+   drill-down reads in.
+
+   The row owns the heading's bottom margin instead of the h1, so the control can
+   never drift away from the title it belongs to, and no other screen's h1 moves.
+   A wider gap than `.row`'s default: this is a title and a mode, not two items of
+   one group. */
+.page-head {
+  gap: var(--space-4);
+  margin: 0 0 var(--space-5);
+}
+.page-head h1,
+.page-head .seg {
+  margin: 0;
+}
+.page-head-containing-switch {
+  margin-top: -6px;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  /* The leading gap separates the row from the screen heading above it; it is
+     set here rather than on h1 so no other screen's heading moves. */
+  margin: var(--space-5) 0 var(--space-4);
+}
+/* No `.filters .field > span` rule: it existed for the one group in this row whose
+   control was not a form element (the segmented Scope switch, now with the page
+   title), and every remaining field is a <label>, whose own rule the span inherits.
+   A `div.field` added here later would need it back. */
+.filters .seg {
+  margin: 0;
+}
+
+.store-note {
+  margin: 0 0 var(--space-4);
+}
+
+.panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  gap: var(--space-4);
+}
+
+/* The strip form: the same panels, summarising one project or one workload
+   inside a section that has already said what it is about. Two per row at any
+   width the section gets, since it is a glance rather than a dashboard. */
+.panels.compact {
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+/* Breathing room under the heading, not just above it: the panels are cards with
+   their own edges, and without the gap the heading reads as attached to the first
+   card rather than as the label for the row. */
+.strip-head {
+  margin: var(--space-5) 0 var(--space-3);
+}
+.strip-head h3 {
+  margin: 0;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-sm);
+  /* The container grows with its content: a fixed height would clip the x-axis
+     band and give the card its own tiny scrollbar. */
+  min-width: 0;
+}
+.panel.compact {
+  padding: var(--space-3);
+  gap: var(--space-1);
+}
+.panel.compact .panel-head {
+  align-items: center;
+}
+/* A refetch holds the previous render at reduced opacity — no skeleton, no
+   layout jump, no flash of an empty chart every poll. */
+.panel.stale {
+  opacity: 0.65;
+  transition: opacity var(--transition);
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.panel-title h3 {
+  margin: 0;
+}
+.panel-metric {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.panel-head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+/* The panel's current figure. Proportional digits on purpose: tabular figures
+   make a standalone number look loose at this size, and nothing is aligned
+   beneath it. */
+.panel-value {
+  font-size: var(--text-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--fg);
+}
+.panel-head .seg {
+  margin: 0;
+}
+.panel-head .seg button {
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+}
+.panel-hint,
+.panel-capped {
+  margin: 0;
+  font-size: var(--text-xs);
+}
+/* The table view lives inside a ~420px panel, so it runs tighter than a
+   full-width page table: five columns at the page's cell padding would need a
+   scrollbar in every panel. It still scrolls rather than wrapping when a series
+   label is long — a broken-up "shop-we / b · replic / a 0" is unreadable. */
+.panel-table {
+  overflow-x: auto;
+}
+.panel-table table.grid {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+.panel-table table.grid th,
+.panel-table table.grid td {
+  padding: var(--space-1) var(--space-2);
+}
+.panel-table table.grid td:not(:first-child) {
+  text-align: right;
+}
+.panel-table table.grid th:not(:first-child) {
+  text-align: right;
+}
+
+/* --- Chart ---------------------------------------------------------------- */
+/* Plain SVG against the tokens, so it re-themes for free. Marks stay thin and
+   the chrome stays recessive: the data is the only thing allowed to be loud. */
+.chart {
+  position: relative;
+  min-width: 0;
+}
+.chart-plot {
+  display: block;
+  width: 100%;
+  touch-action: none;
+}
+.chart-plot:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
+}
+.chart-grid,
+.chart-axis-rule {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.chart-axis {
+  fill: var(--fg-dim);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+.chart-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+/* A wash, never a saturated block — and only ever under a single series, since
+   stacked fills would imply a part-to-whole relationship these metrics do not
+   have. */
+.chart-area {
+  stroke: none;
+  opacity: 0.1;
+}
+/* The surface-colored ring is what keeps two dots legible where they land on the
+   same value; a stroke around the mark would be data-weight ink that is not data. */
+.chart-dot {
+  stroke: var(--bg-elevated);
+  stroke-width: 2;
+}
+.chart-crosshair {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+.chart-empty {
+  margin: var(--space-4) 0;
+}
+
+.chart-tip {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  pointer-events: none;
+  min-width: 140px;
+  padding: var(--space-2);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-xs);
+}
+/* The tooltip moves to whichever side the crosshair is not on, so it never
+   covers the samples being pointed at. */
+.chart-tip.left {
+  right: auto;
+  left: var(--space-2);
+}
+.chart-tip-time {
+  color: var(--fg-dim);
+  margin-bottom: var(--space-1);
+  font-variant-numeric: tabular-nums;
+}
+.chart-tip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  line-height: var(--leading-normal);
+}
+/* Value first and strong, name second and dim: at a crosshair the reader already
+   knows the series and wants the number — the legend's hierarchy, inverted. */
+.chart-tip-value {
+  font-weight: var(--fw-semibold);
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.chart-tip-name {
+  color: var(--fg-dim);
+}
+
+/* A short stroke of the series color, not a filled box: at legend density a box
+   is data-weight ink doing a label's job. */
+.chart-key {
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+}
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+}
+.chart-legend li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.chart-legend-name {
+  color: var(--fg-dim);
+}
+/* The legend carries each series' latest value, which is what keeps every number
+   on the chart reachable without hovering. */
+.chart-legend-value {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Responsive ----------------------------------------------------------- */
+@media (max-width: 720px) {
+  header.appbar {
+    gap: var(--space-3);
+    padding: 0 var(--space-3);
+  }
+  /* The wordmark is the first thing to go when the nav needs the width; the mark
+     alone still identifies the app. */
+  header.appbar .brand-name {
+    display: none;
+  }
+  main {
+    padding: var(--space-4) var(--space-4);
+  }
+  /* Below the breakpoint a 420px minimum would overflow the viewport and give
+     `main` a horizontal scrollbar, so the panels drop to one column. */
+  .panels {
+    grid-template-columns: 1fr;
+  }
+  /* A page table's cells are nowrap, so a six-column grid is wider than a phone
+     no matter how the page is laid out. Left to `main`'s own overflow, reaching
+     the last column drags the WHOLE screen sideways — headings, cards, and every
+     other section travel with it, and the reader loses the page to read one cell.
+     Each grid instead gets its own scroller under the breakpoint, so only the
+     table that is too wide moves. Scoped to mobile deliberately: at desktop
+     widths the tables fit, and a wrapper that scrolls would only add a second
+     scrollbar nobody asked for.
+
+     The table keeps its `width: 100%` — a table can never be narrower than its
+     min-content width, so it still overflows the wrapper and still wraps `td.wrap`
+     columns exactly as it does today. Only the element that scrolls changes. */
+  .table-scroll {
+    overflow-x: auto;
+    /* Reaching the end of a table must not hand the gesture to the page and
+       start scrolling the view underneath it. */
+    overscroll-behavior-x: contain;
+  }
+}
+
+/* --- Toaster -------------------------------------------------------------- */
+/* Transient outcomes (see toast.ts). Fixed to the bottom-right so a message never moves
+   the content that produced it, and above the modal layer so a toast raised while a
+   dialog is open is still readable. */
+.toaster {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  max-width: min(28rem, calc(100vw - var(--space-8)));
+}
+/* A toast is a button because it dismisses on click; it must not look like one. */
+.toast {
+  height: auto;
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--fg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.toast:hover {
+  border-color: var(--border-strong);
+  border-left-color: var(--accent);
+}
+.toast.error {
+  border-left-color: var(--bad);
+}
+
+/* A bind source the explorer declined to expose. Inert: no hover, no pointer — it is an
+   explanation occupying a row, not something to click. */
+.fs-refused td {
+  opacity: 0.75;
+}
+.fs-refused .fs-name {
+  cursor: default;
+}

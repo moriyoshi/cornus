@@ -1,0 +1,11 @@
+# Public-image services so the Compose scenario runs on both the Docker host and
+# kind targets without a build step (kind pulls the image; no kind-load needed).
+name: e2e
+services:
+  cache:
+    image: redis:7-alpine
+  web:
+    image: nginx:1.27-alpine
+    depends_on: [cache]
+    ports:
+      - "8080:80"

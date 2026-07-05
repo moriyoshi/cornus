@@ -1,0 +1,39 @@
+# depends_on EXPANSION fixture (see compose-deps.star). Distinct from
+# compose-dependson.yaml, which is about condition GATING (service_healthy);
+# here the only thing that matters is the shape of the dependency graph.
+#
+# The graph is deliberately two levels deep with a fan-out, so "transitive" is
+# actually exercised rather than merely "direct":
+#
+#   web -> api -> db
+#    \--> cache
+#   solo            (no edges at all)
+#
+# Naming `web` must therefore pull in api, cache AND db (db only via api), and
+# must leave `solo` alone. Every service is the same public alpine sleeper: this
+# scenario judges WHICH workloads exist, never what they serve, so one small
+# image (already pulled by other kube scenarios) keeps the run cheap and the
+# fixture backend-agnostic — no build, no ports, no volumes.
+name: e2edeps
+services:
+  db:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+
+  cache:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+
+  api:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    depends_on: [db]
+
+  web:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    depends_on: [api, cache]
+
+  solo:
+    image: alpine:3.20
+    command: ["sleep", "3600"]

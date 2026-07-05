@@ -1,0 +1,26 @@
+{
+  // The Node-side half of the typecheck. tsconfig.json covers src/ — browser code, with
+  // vite/client's ambient types and DOM in lib. This one covers the build scripts, which
+  // run under Node's native type-stripping and need node: module types and Node globals
+  // that browser code must NOT see.
+  //
+  // Two configs rather than one include list, because `types` is per-program: adding
+  // "node" to the src program would put Node's overloads in scope there, and the one that
+  // matters is setTimeout — it returns a NodeJS.Timeout under those types and a number in
+  // a browser, so src code that stores a timer id would typecheck against the wrong shape
+  // and only fail at runtime. Both are run by `npm run build`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"]
+  },
+  "include": ["scripts"]
+}

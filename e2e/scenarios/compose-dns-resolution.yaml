@@ -1,0 +1,22 @@
+# Two services on a user-defined network, for the bare-name DNS assertion in
+# compose-dns-resolution.star.
+#
+# The network is DECLARED rather than left implicit: the property under test is
+# that a cornus-created user network answers container names, and an implicit
+# default network would not exercise the same create path on every backend.
+#
+# `srv` publishes no ports. Reaching it by bare name from `cli` therefore proves
+# name resolution on the network itself, not a host-port shortcut.
+services:
+  srv:
+    image: nginx:alpine
+    networks:
+      - appnet
+  cli:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks:
+      - appnet
+
+networks:
+  appnet:

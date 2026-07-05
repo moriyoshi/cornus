@@ -1,0 +1,114 @@
+// Regenerates src/components/termFontFaces.css from the installed @fontsource
+// packages. Run it after bumping any of them:
+//
+//   npm run gen:term-fonts
+//
+// TypeScript run directly by Node's native type-stripping, the same way mock/server.ts
+// is, and typechecked by the `npm run build` gate via tsconfig.node.json.
+//
+// Why generate rather than import @fontsource's own CSS. Two reasons, both of which
+// bite silently:
+//
+//  1. The per-subset files it ships (`latin-400.css`, `latin-ext-400.css`) carry NO
+//     `unicode-range`. Importing two of them for one family declares two faces with
+//     identical descriptors, so the last one wins for EVERY codepoint — pull in
+//     latin-ext for accented glyphs and it shadows latin, taking ASCII with it. Only
+//     the package's `index.css` carries the ranges, and that one pulls every subset
+//     and every weight (Arabic, Hebrew, braille, 100 through 800) — megabytes, into a
+//     binary, for a terminal.
+//  2. Its `src:` lists a `.woff` beside each `.woff2`. No browser that can run this
+//     app needs the fallback, but Vite emits both, so half the bytes //go:embed-ed
+//     into every cornus binary would be for a format nothing asks for.
+//
+// So: the subsets a terminal actually renders, at the two weights it actually uses,
+// woff2 only, with the ranges copied from the package that owns them.
+
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const modules = resolve(here, "../node_modules/@fontsource");
+const out = resolve(here, "../src/components/termFontFaces.css");
+
+interface Family {
+  // The npm package under @fontsource, which is also the stem every file it ships
+  // is named with.
+  pkg: string;
+  // The font-family name the package declares, and the one termFont.ts must name in
+  // its stack for any of this to be reachable.
+  family: string;
+}
+
+const FAMILIES: readonly Family[] = [
+  { pkg: "jetbrains-mono", family: "JetBrains Mono" },
+  { pkg: "source-code-pro", family: "Source Code Pro" },
+  { pkg: "fira-code", family: "Fira Code" },
+  { pkg: "cascadia-code", family: "Cascadia Code" },
+  { pkg: "victor-mono", family: "Victor Mono" },
+];
+
+// latin and latin-ext are the text a terminal shows. symbols2 is the box-drawing and
+// block-element range (U+2500-259F) — the one non-alphabetic subset a TUI genuinely
+// needs, and only Fira Code and Cascadia Code ship it; for the rest those glyphs come
+// from the fallback tail of the stack, as they do for every font today.
+const SUBSETS = ["latin", "latin-ext", "symbols2"] as const;
+// The two a terminal paints: regular, and the bold that SGR 1 selects.
+const WEIGHTS = [400, 700] as const;
+const STYLES = ["normal", "italic"] as const;
+
+// The unicode-range for a subset, read out of the package's own unicode.json rather
+// than hardcoded here, so a fontsource update that re-cuts a subset is picked up by a
+// regeneration instead of quietly declaring a range the shipped file does not match.
+// The range is a property of the subset alone — the same across every weight and style
+// of a family, and, as it happens, across all five families for latin and latin-ext.
+function rangeFor(pkg: string, subset: string): string {
+  const ranges = JSON.parse(
+    readFileSync(resolve(modules, pkg, "unicode.json"), "utf8"),
+  ) as Record<string, string>;
+  const r = ranges[subset];
+  if (!r) throw new Error(`no unicode range for subset ${subset} in ${pkg}/unicode.json`);
+  return r;
+}
+
+const blocks: string[] = [];
+for (const { pkg, family } of FAMILIES) {
+  for (const subset of SUBSETS) {
+    for (const weight of WEIGHTS) {
+      for (const style of STYLES) {
+        const stem = `${pkg}-${subset}-${weight}-${style}`;
+        // Not every family cuts every combination: Fira Code has no italic at all,
+        // and only two of the five cut symbols2. A missing file is the normal case,
+        // not an error.
+        if (!existsSync(resolve(modules, pkg, "files", `${stem}.woff2`))) continue;
+        blocks.push(
+          [
+            `@font-face {`,
+            `  font-family: "${family}";`,
+            `  font-style: ${style};`,
+            `  font-weight: ${weight};`,
+            // swap, not block: the terminal is already correct with a fallback face
+            // and Term.tsx re-fits the grid once the real one arrives (see
+            // loadTermFont), so there is nothing to gain from holding the glyphs back
+            // and a blank pane to lose if the fetch is slow.
+            `  font-display: swap;`,
+            `  src: url(@fontsource/${pkg}/files/${stem}.woff2) format("woff2");`,
+            `  unicode-range: ${rangeFor(pkg, subset)};`,
+            `}`,
+          ].join("\n"),
+        );
+      }
+    }
+  }
+}
+
+const header = `/* GENERATED by scripts/gen-term-font-faces.ts — do not edit by hand.
+ * Regenerate with \`npm run gen:term-fonts\`.
+ *
+ * The @font-face declarations for the bundled terminal fonts offered by the Terminal
+ * font setting. See src/components/termFont.ts for the catalogue that names them and
+ * the fallback stack each is handed to xterm inside.
+ */\n\n`;
+
+writeFileSync(out, header + blocks.join("\n\n") + "\n");
+console.log(`wrote ${out}: ${blocks.length} faces`);

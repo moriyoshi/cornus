@@ -1,0 +1,20 @@
+# Two services on an `ipvlan`-driver network. On kubernetes with Multus
+# present, the netdriver realises this as a NetworkAttachmentDefinition whose
+# CNI config is the ipvlan plugin with the given parent (master) interface —
+# on kind that is the node container's default NIC, eth0 unless
+# E2E_MULTUS_PARENT overrides it. Pod-to-pod traffic between two ipvlan slaves
+# of the same parent is switched inside the parent (L2 mode), so the pinned
+# static addresses are mutually reachable without a gateway.
+services:
+  a:
+    image: nginx:alpine
+    networks: [imesh]
+  b:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [imesh]
+networks:
+  imesh:
+    driver: ipvlan
+    driver_opts:
+      master: ${E2E_MULTUS_PARENT:-eth0}

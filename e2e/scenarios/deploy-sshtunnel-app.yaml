@@ -1,0 +1,9 @@
+# Minimal public-image project for the ssh-tunnel scenario: deployed purely
+# through a stored `cornus config` ssh-tunnel profile (no -H/--host). A distinct
+# project name and no published ports keep it isolated from other scenarios;
+# nginx's default command serves, so no command override is needed and it stays
+# backend-agnostic.
+name: sshtun
+services:
+  web:
+    image: nginx:1.27-alpine
