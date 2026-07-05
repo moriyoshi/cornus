@@ -1,0 +1,17 @@
+version: 2
+
+# Keep the SHA-pinned GitHub Actions in .github/workflows/ current. Dependabot
+# understands the `uses: owner/repo@<sha> # vX.Y.Z` pin format: it bumps both the
+# commit SHA and the trailing version comment, so the pins stay both immutable and
+# up to date. All action bumps are grouped into a single weekly PR to cut noise.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci

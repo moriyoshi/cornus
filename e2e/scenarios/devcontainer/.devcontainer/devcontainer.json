@@ -1,0 +1,43 @@
+{
+    // Single-container (image-based) Dev Container fixture for the E2E harness.
+    // The cornus image doubles as the app (kept alive) and — because the
+    // defining devcontainer workspace bind mount deploys over the deploy-attach
+    // 9P path — as the mount-agent sidecar, exactly like compose-mounts.yaml.
+    // A trivial postCreateCommand exercises the server-side-exec lifecycle hook.
+    "name": "cornus-devcontainer-e2e",
+    "image": "cornus:e2e",
+    "workspaceFolder": "/workspace",
+    "overrideCommand": true,
+    "postCreateCommand": "echo devcontainer-postcreate-ok",
+    // runArgs: the single-container flavor forwards these docker-run flags onto
+    // the synthesized compose service (pkg/devcontainer/runargs.go). Every flag
+    // here was picked because it (a) survives the translation all the way to the
+    // KUBERNETES backend — this scenario is kube-only — and (b) is observable
+    // FROM INSIDE the container, so the assertions read the running container's
+    // own kernel view rather than the spec cornus generated.
+    //
+    //   --cap-add SYS_PTRACE  -> securityContext.capabilities.add  (CapEff bit 19)
+    //   --cap-drop MKNOD      -> securityContext.capabilities.drop (CapEff bit 27)
+    //   --shm-size 256m       -> emptyDir{medium: Memory, sizeLimit: 256Mi} at /dev/shm
+    //   --hostname devbox     -> podSpec.hostname
+    //
+    // Deliberately NOT here, because they are docker-only and this fixture must
+    // not assert something the kube leg cannot honor:
+    //   --ulimit / --device   parsed, then dropped by the kubernetes backend with
+    //                         a warning (warnUnsupportedResourceKeys)
+    //   --init                parsed, but kubernetes has no tini equivalent
+    //   --pids-limit          not recognized by runArgs at all
+    //   --security-opt seccomp=…/apparmor=…
+    //                         parsed, but only no-new-privileges and label=k:v
+    //                         have a securityContext equivalent
+    "runArgs": [
+        "--cap-add",
+        "SYS_PTRACE",
+        "--cap-drop",
+        "MKNOD",
+        "--shm-size",
+        "256m",
+        "--hostname",
+        "devbox",
+    ],
+}

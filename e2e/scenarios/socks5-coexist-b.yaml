@@ -1,0 +1,6 @@
+# Project B for socks5-coexist.star: a single nginx service `webb`. Deploys as
+# `coexb-webb`. Reached by a SESSION-LOCAL proxy, coexisting with project A's.
+name: coexb
+services:
+  webb:
+    image: nginx:1.27-alpine

@@ -1,0 +1,15 @@
+# depends_on: service_completed_successfully fixture. `migrate` is a one-shot
+# that exits 0 and (restart: "no") stays exited; `app` must not start until
+# migrate has completed successfully. Public images, no build.
+name: cdc
+services:
+  migrate:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo migrating; exit 0"]
+    restart: "no"
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully

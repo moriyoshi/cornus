@@ -1,0 +1,35 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+spec:
+  # cert-manager writes the issued cert/key (and ca.crt) into this Secret, which the
+  # StatefulSet mounts. On renewal cert-manager rewrites it and cornus hot-reloads.
+  secretName: {{ .Values.tls.secretName }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  dnsNames:
+    {{- if .Values.tls.certManager.dnsNames }}
+    {{- range .Values.tls.certManager.dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- else }}
+    - {{ printf "%s.%s.svc" (include "cornus.fullname" .) .Release.Namespace | quote }}
+    - {{ printf "%s.%s.svc.cluster.local" (include "cornus.fullname" .) .Release.Namespace | quote }}
+    {{- if gt (int .Values.replicas) 1 }}
+    # Per-pod names under the headless hub Service, which inter-replica
+    # /.cornus/v1/hub/forward dials use (CORNUS_HUB_FORWARD_URL). Note those dials
+    # verify against the container's system trust store; see values.yaml
+    # "replicas" for the caveat.
+    - {{ printf "*.%s-hub.%s.svc" (include "cornus.fullname" .) .Release.Namespace | quote }}
+    - {{ printf "*.%s-hub.%s.svc.cluster.local" (include "cornus.fullname" .) .Release.Namespace | quote }}
+    {{- end }}
+    {{- end }}
+  issuerRef:
+    name: {{ required "tls.certManager.issuerRef.name is required when certManager is enabled" .Values.tls.certManager.issuerRef.name }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    group: cert-manager.io
+{{- end }}

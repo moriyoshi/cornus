@@ -1,0 +1,272 @@
+name: E2E
+
+# Executes the full Starlark E2E harness inside the all-in-one containerized
+# runner (Docker-in-Docker + the in-process build engine + kind/kubectl). This is
+# the execution counterpart to the lightweight `e2e-check` syntax gate in ci.yml:
+# ci.yml parses+resolves every scenario on each PR, this workflow actually runs
+# them.
+#
+# It is heavy and must run privileged, so it is scoped to merges into main and
+# manual dispatch rather than every PR. See TESTING.md "Containerized runner".
+#
+# It also carries the two MULTI-REPLICA hub jobs at the bottom. Those are not
+# Starlark scenarios — the harness runs a single `cornus serve`, so cross-process
+# hub behaviour is out of its reach by construction — but they share this
+# workflow's "heavy, privileged, off the PR path" profile exactly.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One E2E run per ref; a newer push supersedes an in-flight one.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.leg }})
+    runs-on: ubuntu-24.04
+    # The kube target pre-creates a kind cluster inside the DinD image and runs
+    # the full suite through it; give every target generous headroom.
+    timeout-minutes: 60
+    strategy:
+      # Report each leg independently — a kube flake must not mask a real
+      # docker regression (or vice versa). The containerd leg runs the
+      # backend-agnostic scenario subset against the image's in-container
+      # standalone containerd (the entrypoint's CONTAINERD_SCENARIOS default).
+      fail-fast: false
+      matrix:
+        include:
+          - leg: docker
+            target: docker
+          - leg: kube
+            target: kube
+          - leg: containerd
+            target: containerd
+          # The two backends that had NO live CI coverage at all. They are the
+          # least-tested of the five (barehost 5,368 production LOC / 2,064 test;
+          # incushost 1,563 / 733 — ratios 0.38 and 0.47, against 0.86-1.09 for
+          # the three backends already covered above), so the verification gap
+          # they carried was the widest in the deploy layer.
+          #
+          # Both run through the SAME privileged containerized runner as the legs
+          # above; neither needs anything installed on the GitHub-hosted host:
+          #   - bare drives runc directly (no daemon) using the runc + CNI
+          #     reference plugins staged into the runner image.
+          #   - incus runs the runner image's OWN incusd (Incus 7.2 from the
+          #     Zabbly apt repo — see e2e/container/Dockerfile), which
+          #     entrypoint.sh's start_incus launches and initializes with a
+          #     NAT/firewall-free bridge preseed. Nothing dials out to a host
+          #     daemon, so no self-hosted runner is required.
+          #
+          # strict: "1" (below) is the load-bearing bit — see the precondition
+          # gate step. Both legs leave `scenarios` empty so the entrypoint uses
+          # its per-target default subset (BARE_SCENARIOS / INCUS_SCENARIOS, kept
+          # in sync with the Makefile by TestScenarioSubsetsInSync).
+          - leg: bare
+            target: bare
+            strict: "1"
+          - leg: incus
+            target: incus
+            strict: "1"
+          # A SECOND kube leg with a real ingress controller installed. It cannot
+          # be folded into the kube leg above: installing ingress-nginx changes
+          # what the other ingress scenarios mean. ingress-tunnel-ssh.star
+          # self-skips once a controller exists, and ingress-front-door.star's
+          # kube run exists precisely to cover the no-controller mux fallback —
+          # so flipping E2E_INGRESS_NGINX on the main kube leg would silently
+          # TRADE that coverage away rather than add to it. Two legs keep both.
+          #
+          # Scoped to the ingress scenarios rather than the whole suite: the rest
+          # is unaffected by a controller and already ran on the kube leg.
+          # deploy-ingress.star is included even though it needs no controller —
+          # ingress-nginx installs a ValidatingWebhookConfiguration that inspects
+          # every Ingress cornus creates, so running it here additionally proves
+          # the generated objects survive real admission, which the controller-
+          # less leg cannot see.
+          - leg: kube-ingress
+            target: kube
+            ingress_nginx: "1"
+            scenarios: >-
+              e2e/scenarios/deploy-ingress.star
+              e2e/scenarios/ingress-tunnel-controller.star
+              e2e/scenarios/ingress-settings-controller.star
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the all-in-one E2E runner image
+        # Build the same image as `make e2e-image`, but through buildx with a
+        # cross-run GitHub Actions layer cache so the golang deps + staged tools
+        # (kind/kubectl/crane/multus) are not refetched every run. load: true
+        # drops the result into the local docker so the run step can start it.
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: e2e/container/Dockerfile
+          tags: cornus-e2e:ci
+          load: true
+          # The kube legs additionally embed the OpenTelemetry Collector (the
+          # `otelcol` tag) so the caretaker sidecar can run the otel-collector
+          # scenario, and the built-in observability store (`imbh` +
+          # `sable_extern_lib`); the other legs stay lean. Per-arg buildkit cache
+          # keeps both variants under one scope.
+          #
+          # `imbh` is what makes the observability suite RUN. It is cgo-only, and
+          # this stage is CGO_ENABLED=0 without it, so `/.cornus/v1/obs/status`
+          # 404s and EIGHT of the ten observability-*.star scenarios self-skip —
+          # which is what every containerized leg did, silently, for as long as
+          # they have existed. `sable_extern_lib` is inseparable: the Dockerfile
+          # hard-fails on `imbh` without it, because the store would link the
+          # wrong runtime. The cost is a ~2.06 GB image instead of ~1.90 GB and a
+          # cgo (glibc-dynamic) cornus, which is fine for both places it lands —
+          # the runner image and the cornus:e2e sidecar image are the same
+          # debian:bookworm-slim.
+          #
+          # Keyed on the TARGET, not the leg, so both kube legs build the one
+          # image variant and share its cache entry; the kube-ingress leg does not
+          # need the store, but giving it a third variant would cost more build
+          # time than the store costs it.
+          build-args: |
+            BUILD_TAGS=${{ matrix.target == 'kube' && 'netgo osusergo otelcol imbh sable_extern_lib' || 'netgo osusergo' }}
+          cache-from: type=gha,scope=e2e-image
+          cache-to: type=gha,mode=max,scope=e2e-image
+
+      - name: Load 9p kernel modules on the runner host
+        # The E2E runner container runs --privileged and shares the host kernel,
+        # so the 9p filesystem support that the kube mount sidecar and the
+        # lazy_9p build scenario need must be loaded on the runner itself: the
+        # module objects live under the host's /lib/modules, not in the container
+        # image, and preflight (probe9P) only sees 9p once it is in
+        # /proc/filesystems. GitHub-hosted ubuntu runners ship these modules but
+        # do not preload them. trans=unix only needs 9p + 9pnet (fd transport is
+        # built into 9pnet); 9pnet_virtio is loaded best-effort for completeness.
+        run: |
+          sudo modprobe 9p 9pnet
+          sudo modprobe 9pnet_virtio || true
+          lsmod | grep 9p || true
+          if ! grep -qw 9p /proc/filesystems; then
+            echo "::error::9p not in /proc/filesystems after modprobe — runner kernel lacks the 9p module" >&2
+            exit 1
+          fi
+          echo "9p filesystem available on the runner host"
+
+      - name: Assert the ${{ matrix.leg }} precondition (daemon/runtime present)
+        # ONLY for the legs that declare strict: "1" (bare, incus). Those two legs
+        # exist for exactly one backend, so "the thing this leg tests is not here"
+        # must be RED, never a green run that proved nothing — and both had that
+        # failure mode:
+        #
+        #   * entrypoint.sh's start_incus SELF-SKIPS (return 2 -> continue, rc=0)
+        #     when incusd is older than 6.3, i.e. lacks OCI application-container
+        #     support. On the full-suite legs that is right; on a dedicated incus
+        #     leg it means the job goes green having deployed nothing.
+        #   * setup_bare's prepare_bare_agent_image is best-effort; without the
+        #     image, deploy-egress-bare.star and deploy-mounts-sidecar-bare.star
+        #     both print "skipped" and exit 0 — 2 of the 15 bare scenarios.
+        #
+        # E2E_STRICT=1 converts both into hard failures (see entrypoint.sh), and
+        # E2E_PREFLIGHT_ONLY=1 makes this step do the real per-target bring-up
+        # (start + initialize incusd / stage the bare runtime + agent image) and
+        # then run the harness's own `cornus-e2e --preflight` probe INSTEAD of the
+        # scenarios. That probe is already a fail-fast gate: it checks a reachable
+        # Incus daemon plus skopeo/umoci (CapIncus) and runc-on-PATH-as-root
+        # (CapOCIRuntime), and exits non-zero when either is missing.
+        #
+        # It runs as its own step so a missing daemon fails in ~1 minute with a
+        # legible message instead of somewhere inside a 20-minute suite, and so the
+        # job's red step names the cause. The full run below repeats E2E_STRICT=1,
+        # so nothing can silently self-skip there either.
+        if: matrix.strict == '1'
+        run: |
+          docker run --rm --privileged \
+            -e E2E_TARGETS="${{ matrix.target }}" \
+            -e E2E_STRICT=1 \
+            -e E2E_PREFLIGHT_ONLY=1 \
+            -e E2E_SCENARIOS="${{ matrix.scenarios }}" \
+            cornus-e2e:ci
+
+      - name: Run the E2E suite (${{ matrix.leg }})
+        # The entrypoint starts dockerd, runs preflight, and for the kube target
+        # spins up (and tears down) the in-container kind cluster. It must be
+        # privileged: the build engine mounts overlayfs / creates namespaces and
+        # kind needs it too. A non-zero exit fails the job.
+        #
+        # The add-on installs are keyed on the LEG, not the target, so the
+        # kube-ingress leg does not spend time installing Multus and Knative for
+        # a three-scenario ingress run.
+        #
+        # E2E_MULTUS=1 on the kube leg makes the entrypoint install the Multus
+        # DaemonSet staged in the runner image into the kind cluster, so the
+        # deploy-multus scenario actually runs instead of self-skipping. The
+        # docker and containerd legs keep it off (Multus is kube-only).
+        #
+        # E2E_KNATIVE=1 on the kube leg likewise makes the entrypoint install
+        # Knative Serving + Kourier (from the manifests VENDORED into the runner
+        # image at a pinned version — no release download at test time; the kind
+        # nodes still pull the digest-pinned images, as they already do for the
+        # alpine deploy-ingress uses) so the deploy-knative scenario round-trips a
+        # real ksvc instead of self-skipping. kube-only, like Multus.
+        #
+        # E2E_METRICS_SERVER=1 (kube leg only) installs metrics-server into the
+        # kind cluster. It is not an alternative path through a feature: the
+        # metrics.k8s.io aggregated API is the ONLY metric source the kubernetes
+        # deploy backend has, so without it observability-metrics.star has nothing
+        # to exercise and self-skips. It is inseparable from the `imbh` build tag
+        # above and must not be set without it — the scenario deliberately
+        # HARD-FAILS when metrics-server is installed but the build has no store,
+        # so that a leg which paid for the install cannot go green having asserted
+        # nothing.
+        #
+        # E2E_INGRESS_NGINX=1 (kube-ingress leg only) installs a real ingress
+        # controller, which is what un-skips ingress-tunnel-controller.star and
+        # ingress-settings-controller.star. E2E_SCENARIOS narrows that leg to the
+        # ingress set; empty on every other leg, where the entrypoint falls back
+        # to its own per-target default list.
+        #
+        # E2E_STRICT=1 (bare + incus legs) keeps the entrypoint's self-skip paths
+        # closed for the whole run, not just the gate step above: a dedicated
+        # backend leg must never exit 0 having skipped the backend. It is 0
+        # everywhere else, where the full-suite legs legitimately rely on
+        # self-skips.
+        run: |
+          docker run --rm --privileged \
+            -e E2E_TARGETS="${{ matrix.target }}" \
+            -e E2E_STRICT="${{ matrix.strict || '0' }}" \
+            -e E2E_MULTUS="${{ matrix.leg == 'kube' && '1' || '0' }}" \
+            -e E2E_KNATIVE="${{ matrix.leg == 'kube' && '1' || '0' }}" \
+            -e E2E_METRICS_SERVER="${{ matrix.leg == 'kube' && '1' || '0' }}" \
+            -e E2E_INGRESS_NGINX="${{ matrix.ingress_nginx || '0' }}" \
+            -e E2E_SCENARIOS="${{ matrix.scenarios }}" \
+            -e CORNUS_TEST_OTEL="${{ matrix.leg == 'kube' && '1' || '' }}" \
+            cornus-e2e:ci
+
+  # ===========================================================================
+  # Multi-replica hub
+  # ===========================================================================
+  # There are no longer dedicated multireplica-redis / multireplica-kube jobs.
+  # The cross-PROCESS hub behaviour they covered — two replicas sharing a hub
+  # registry, cross-replica delivery forwarding, shared-store liveness — is now
+  # e2e/scenarios/hub-multireplica-redis.star and hub-multireplica-kube.star,
+  # which are in the Makefile SCENARIOS list and therefore run inside the docker
+  # and kube legs of the matrix above.
+  #
+  # The Starlark harness used to drive exactly ONE `cornus serve`, which is why
+  # this lived in shell at all; `serve(name=, addr=)` now starts additional
+  # replicas, so the coverage moved into the suite. That also buys what the two
+  # shell scripts never had: parse and resolve checking via `make e2e-check`, and
+  # visibility to TestPredeclaredNamesInSync. The elaborate self-skip guards these
+  # jobs carried (asserting a `PASS:` line, asserting docker was really present)
+  # existed because a script could exit 0 without running; a scenario that skips
+  # is reported by the runner, so the guard is the runner's job now.
+  #
+  # Each scenario gates on TARGET and no-ops on the other legs, so the redis one
+  # runs for real on the docker leg and the KubeStore one on the kube leg.

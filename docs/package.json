@@ -1,0 +1,22 @@
+{
+  "name": "cornus-docs",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Documentation site for Cornus",
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview",
+    "docs:check-anchors": "python3 ../.agents/skills/assess-doc-quality/scripts/check_anchors.py --src . --dist .vitepress/dist",
+    "docs:check-duplicate-targets": "python3 ../.agents/skills/assess-doc-quality/scripts/check_duplicate_targets.py --src .",
+    "docs:check-punctuation": "python3 ../.agents/skills/assess-doc-quality/scripts/check_punctuation.py --src .",
+    "docs:check-translation-freshness": "python3 ../.agents/skills/translate-documents/scripts/translation_state.py check --source-root .",
+    "docs:check": "npm run docs:check-punctuation && npm run docs:build && npm run docs:check-anchors && npm run docs:check-duplicate-targets && npm run docs:check-translation-freshness"
+  },
+  "devDependencies": {
+    "mermaid": "^11.16.0",
+    "vitepress": "^1.6.3",
+    "vitepress-plugin-mermaid": "^2.0.17"
+  }
+}
