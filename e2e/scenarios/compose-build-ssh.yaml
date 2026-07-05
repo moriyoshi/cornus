@@ -1,0 +1,12 @@
+# A service whose build section requests SSH agent forwarding via `build.ssh`.
+# Exercises the compose SSH path: `cornus compose build` must resolve "default"
+# to $SSH_AUTH_SOCK and tunnel the agent to the server's build engine so the
+# Dockerfile's `RUN --mount=type=ssh` sees the caller's key.
+name: cbssh
+services:
+  app:
+    build:
+      context: ./compose-build-ssh/app
+      ssh:
+        - default
+    command: ["sh", "-c", "sleep infinity"]

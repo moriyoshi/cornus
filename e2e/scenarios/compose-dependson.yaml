@@ -1,0 +1,17 @@
+# depends_on condition-gating E2E fixture: `web` waits for `db` to become
+# healthy before it starts. redis ships redis-cli, so the healthcheck needs no
+# extra tooling. Public images so it runs on both the Docker host and kind targets.
+name: e2edep
+services:
+  db:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      db:
+        condition: service_healthy

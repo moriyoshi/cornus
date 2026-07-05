@@ -1,0 +1,12 @@
+{
+    // Single-container (image-based) Dev Container fixture for the E2E harness.
+    // The cornus image doubles as the app (kept alive) and — because the
+    // defining devcontainer workspace bind mount deploys over the deploy-attach
+    // 9P path — as the mount-agent sidecar, exactly like compose-mounts.yaml.
+    // A trivial postCreateCommand exercises the server-side-exec lifecycle hook.
+    "name": "cornus-devcontainer-e2e",
+    "image": "cornus:e2e",
+    "workspaceFolder": "/workspace",
+    "overrideCommand": true,
+    "postCreateCommand": "echo devcontainer-postcreate-ok",
+}

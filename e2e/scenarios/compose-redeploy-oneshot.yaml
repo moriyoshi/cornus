@@ -1,0 +1,27 @@
+# A single RUNNING one-shot service WITH an anonymous managed volume. restart:"no"
+# maps to a Kubernetes Job on the kube backend, and the command sleeps while
+# ignoring SIGTERM so the Job pod stays Running (not Completed). On a re-apply the
+# old Job is deleted foreground, so it lingers for the whole stop_grace_period
+# before its pod is SIGKILLed and the Job clears — the window the recreate must wait
+# out. See compose-redeploy-oneshot.star.
+#
+# The anonymous volume is deliberate: an anonymous managed volume becomes a PVC
+# OWNED by the Job, so the foreground Job delete on re-apply cascades a GC of that
+# PVC. The recreate's PVC ensure then races the still-terminating claim — if it
+# adopts the doomed claim, the new pod wedges Unschedulable
+# ("persistentvolumeclaim ... not found") once the GC completes. This makes the
+# scenario exercise ensurePVC's wait-out-then-recreate path, not just waitJobGone.
+name: rdoneshot
+services:
+  worker:
+    image: alpine:3.20
+    restart: "no"
+    stop_grace_period: 8s
+    command: ["sh", "-c", "trap '' TERM; sleep 3600"]
+    volumes:
+      # ANONYMOUS volume (target only, no named source): the netdriver names its PVC
+      # <project>-<service>-vol-<i> (rdoneshot-worker-vol-0) and owns it by the Job,
+      # which is what the scenario asserts and what makes the GC-cascade race real. A
+      # named volume ("data:/data" + a top-level volumes: entry) would instead yield an
+      # un-owned cornus-vol-<name>-<hash> PVC and defeat both. Keep it anonymous.
+      - /data

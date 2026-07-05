@@ -1,0 +1,15 @@
+# An nginx service with custom x-cornus-ingress hosts, for the emulate-mode
+# ingress-via-conduit E2E. Public image so it runs on docker + kube with no build.
+# The hosts bear no .cornus.internal suffix, so only the emulated ingress can route
+# them through the conduit.
+name: e2e
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    x-cornus-ingress:
+      hosts:
+        - app.example.com
+        - www.app.example.com
+      path: /

@@ -1,0 +1,388 @@
+{{- $multi := gt (int .Values.replicas) 1 -}}
+{{- if and $multi (not (hasPrefix "s3://" .Values.storage)) -}}
+{{- fail "replicas > 1 requires shared object storage: set storage to an s3:// URL (each replica gets its own PVC, so a PVC-backed registry CAS would be inconsistent across replicas)" -}}
+{{- end -}}
+{{- if and .Values.auth.jwt.jwksURL (or .Values.auth.jwt.jwksConfigMap .Values.auth.jwt.jwksSecret) -}}
+{{- fail "set only one of auth.jwt.jwksURL or auth.jwt.jwksConfigMap/jwksSecret (the server rejects CORNUS_JWT_JWKS_FILE together with CORNUS_JWT_JWKS_URL)" -}}
+{{- end -}}
+{{- if and .Values.auth.jwt.jwksConfigMap .Values.auth.jwt.jwksSecret -}}
+{{- fail "set only one of auth.jwt.jwksConfigMap or auth.jwt.jwksSecret" -}}
+{{- end -}}
+{{- if and .Values.gc.lease (not .Values.gc.interval) -}}
+{{- fail "gc.lease requires gc.interval: the lease only coordinates the periodic GC scheduler (the server rejects CORNUS_GC_LEASE without CORNUS_GC_INTERVAL)" -}}
+{{- end -}}
+{{- if and .Values.tailscale.enabled (not .Values.tailscale.authKeySecret) -}}
+{{- fail "tailscale.enabled requires tailscale.authKeySecret: the sidecar needs an unattended auth key to join the tailnet (see values.yaml \"tailscale\")" -}}
+{{- end -}}
+{{- $jwksMount := or .Values.auth.jwt.jwksConfigMap .Values.auth.jwt.jwksSecret -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+spec:
+  {{- if $multi }}
+  {{- /* The headless Service gives each replica the stable per-pod DNS name its
+       CORNUS_HUB_FORWARD_URL advertises. serviceName is immutable: moving an
+       existing release across the 1 <-> >1 boundary requires deleting the
+       StatefulSet first (PVCs are retained). */}}
+  serviceName: {{ include "cornus.fullname" . }}-hub
+  {{- else }}
+  serviceName: {{ include "cornus.fullname" . }}
+  {{- end }}
+  replicas: {{ int .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cornus.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cornus.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "cornus.fullname" . }}
+      {{- if eq .Values.registry.exposure "hostNetwork" }}
+      # Host-network exposure: the registry listens in the node netns, so nodes pull
+      # it NetworkPolicy-free. Requires a privileged PodSecurity namespace.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- if .Values.tailscale.enabled }}
+      initContainers:
+        # Copies the `tailscale` CLI out of the sidecar image onto a volume
+        # shared with the cornus container, so cornus can shell out to it
+        # (CORNUS_TUNNEL_TAILSCALE_BIN) with no custom cornus image.
+        - name: tailscale-bin
+          image: "{{ .Values.tailscale.image.repository }}:{{ .Values.tailscale.image.tag }}"
+          imagePullPolicy: {{ .Values.tailscale.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "cp /usr/local/bin/tailscale /tailscale-bin/tailscale"]
+          volumeMounts:
+            - name: tailscale-bin
+              mountPath: /tailscale-bin
+      {{- end }}
+      containers:
+        - name: cornus
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "serve"
+            - "--addr"
+            - "{{ .Values.addr }}"
+            {{- if .Values.tls.enabled }}
+            - "--tls-cert"
+            - "/etc/cornus/tls/tls.crt"
+            - "--tls-key"
+            - "/etc/cornus/tls/tls.key"
+            {{- if .Values.tls.clientCA }}
+            - "--tls-client-ca"
+            - "/etc/cornus/tls/ca.crt"
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 5000
+              {{- if eq .Values.registry.exposure "hostPort" }}
+              # Bind the registry port on the node so nodes pull it NetworkPolicy-
+              # free. Requires the CNI portmap plugin; pin the pod with nodeSelector.
+              hostPort: {{ .Values.registry.hostPort | default 5000 }}
+              {{- end }}
+          env:
+            - name: CORNUS_DATA
+              value: /var/lib/cornus
+            - name: CORNUS_DEPLOY_BACKEND
+              value: {{ .Values.deployBackend | quote }}
+            {{- with .Values.storage }}
+            - name: CORNUS_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            # Pin the kubernetes deploy backend (and, when replicas > 1, the
+            # hub records) to the release namespace, where the chart's Role
+            # grants access. Without this the server falls back to the
+            # "default" namespace regardless of where the release lives.
+            - name: CORNUS_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.advertise.enabled }}
+            # In-cluster cornus URL that pod mount-agents and caretaker sidecars
+            # dial back for the mount / egress / credential relays. Empty
+            # advertise.url (the default) derives this server's own fully-qualified
+            # Service DNS name (host and port), so it resolves from any pod in the
+            # cluster; set advertise.url to override. advertise.enabled=false omits
+            # the var entirely (see values.yaml "advertise").
+            - name: CORNUS_ADVERTISE_URL
+              value: {{ .Values.advertise.url | default (printf "ws%s://%s.%s.svc:%v" (ternary "s" "" .Values.tls.enabled) (include "cornus.fullname" .) .Release.Namespace .Values.service.port) | quote }}
+            {{- end }}
+            {{- with .Values.registry.advertiseHost }}
+            # Registry host that deploy pull refs carry (served at GET /.cornus/v1/info).
+            # Required for clusterIP / hostPort / hostNetwork / ingress exposure,
+            # which the server cannot introspect from the Service alone. NodePort is
+            # auto-advertised from the Service and needs no value here.
+            - name: CORNUS_ADVERTISE_REGISTRY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $multi }}
+            # Multi-replica hub: shared provider records as HubEndpoint CRs plus
+            # per-replica Leases (see values.yaml "replicas").
+            - name: CORNUS_HUB_STORE
+              value: kube
+            # Downward API identity: POD_NAME is the replica id and, with
+            # POD_NAMESPACE, the Pod ownerReference for crash GC of hub records.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The base URL peer replicas dial to forward a hub delivery to this
+            # replica (GET /.cornus/v1/hub/forward): this pod's stable DNS name under
+            # the headless Service.
+            - name: CORNUS_HUB_FORWARD_URL
+              value: "ws{{ if .Values.tls.enabled }}s{{ end }}://$(POD_NAME).{{ include "cornus.fullname" . }}-hub.{{ .Release.Namespace }}.svc:5000"
+            {{- end }}
+            {{- with .Values.gc.interval }}
+            # Periodic storage GC (see values.yaml "gc").
+            - name: CORNUS_GC_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.gc.lease }}
+            # Cross-replica GC coordination: only the coordination.k8s.io Lease
+            # holder sweeps on each tick, so the interval is safe on every
+            # replica. The chart Role grants the Lease verbs.
+            - name: CORNUS_GC_LEASE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.ingress }}
+            # Automatic-ingress defaults (see values.yaml "ingress"). These are the
+            # SERVER-SIDE fallbacks; a client deploy/compose may override the domain,
+            # class, and issuer per workload unless `enforceDomain` pins the domain.
+            {{- with .domain }}
+            - name: CORNUS_INGRESS_DOMAIN
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .className }}
+            - name: CORNUS_INGRESS_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .tlsIssuer }}
+            - name: CORNUS_INGRESS_TLS_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .enforceDomain }}
+            - name: CORNUS_INGRESS_ENFORCE_DOMAIN
+              value: "true"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.fileCache.enabled }}
+            # Server-side per-file block cache (see values.yaml "fileCache"). Its
+            # backing files live under CORNUS_DATA, so they persist on the data-dir
+            # PVC and are pruned by the storage GC.
+            - name: CORNUS_FILE_CACHE
+              value: "true"
+            # The cache directory is mandatory (no server default). With a
+            # dedicated volume it is the separate mount; otherwise a subdirectory
+            # of the data-dir PVC.
+            - name: CORNUS_FILE_CACHE_DIR
+              value: {{ if .Values.fileCache.persistence.enabled }}/var/lib/cornus-filecache{{ else }}/var/lib/cornus/filecache{{ end }}
+            {{- with .Values.fileCache.chunkSize }}
+            - name: CORNUS_FILE_CACHE_CHUNK_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.fileCache.maxBytes }}
+            - name: CORNUS_FILE_CACHE_MAX_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.caretakerTlsSecret }}
+            # Caretaker sidecar TLS: the deploy backend projects this Secret
+            # (ca.crt / tls.crt / tls.key) into server-bound caretaker sidecars
+            # and points their config at the mounted paths (see values.yaml).
+            - name: CORNUS_CARETAKER_TLS_SECRET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.auth.jwt.jwksURL }}
+            - name: CORNUS_JWT_JWKS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $jwksMount }}
+            - name: CORNUS_JWT_JWKS_FILE
+              value: {{ printf "/etc/cornus/jwks/%s" .Values.auth.jwt.jwksKey | quote }}
+            {{- end }}
+            {{- with .Values.auth.jwt.audience }}
+            - name: CORNUS_JWT_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.auth.jwt.issuer }}
+            - name: CORNUS_JWT_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.tailscale.enabled }}
+            # Tailscale Funnel sidecar (see values.yaml "tailscale"): the CLI
+            # binary the initContainer copied in, and the control socket of
+            # the tailscaled sidecar it talks to.
+            - name: CORNUS_TUNNEL_BACKEND
+              value: tailscale
+            - name: CORNUS_TUNNEL_TAILSCALE_BIN
+              value: /var/lib/tailscale-bin/tailscale
+            - name: TS_SOCKET
+              value: /var/run/tailscale/tailscaled.sock
+            {{- end }}
+          securityContext:
+            privileged: {{ .Values.privileged }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cornus
+            {{- if and .Values.fileCache.enabled .Values.fileCache.persistence.enabled }}
+            - name: filecache
+              mountPath: /var/lib/cornus-filecache
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/cornus/tls
+              readOnly: true
+            {{- end }}
+            {{- if $jwksMount }}
+            - name: jwks
+              mountPath: /etc/cornus/jwks
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tailscale.enabled }}
+            - name: tailscale-bin
+              mountPath: /var/lib/tailscale-bin
+              readOnly: true
+            - name: tailscale-socket
+              mountPath: /var/run/tailscale
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5000
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 5000
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.tailscale.enabled }}
+        - name: tailscale
+          image: "{{ .Values.tailscale.image.repository }}:{{ .Values.tailscale.image.tag }}"
+          imagePullPolicy: {{ .Values.tailscale.image.pullPolicy }}
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tailscale.authKeySecret }}
+                  key: {{ .Values.tailscale.authKeySecretKey }}
+            - name: TS_HOSTNAME
+              value: {{ .Values.tailscale.hostname | default (include "cornus.fullname" .) | quote }}
+            - name: TS_STATE_DIR
+              value: /var/lib/tailscale
+            # Userspace networking: Funnel only needs to proxy a local port
+            # through tailscaled's control connection, so the sidecar needs
+            # neither NET_ADMIN nor a /dev/net/tun device.
+            - name: TS_USERSPACE
+              value: "true"
+            - name: TS_SOCKET
+              value: /var/run/tailscale/tailscaled.sock
+            {{- with .Values.tailscale.extraArgs }}
+            - name: TS_EXTRA_ARGS
+              value: {{ . | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+            - name: tailscale-socket
+              mountPath: /var/run/tailscale
+          resources:
+            {{- toYaml .Values.tailscale.resources | nindent 12 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if $multi }}
+      # Prefer spreading replicas across nodes; soft, so single-node clusters
+      # still schedule. An explicit affinity value replaces this default.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "cornus.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- if or .Values.tls.enabled $jwksMount .Values.tailscale.enabled }}
+      volumes:
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- with .Values.auth.jwt.jwksConfigMap }}
+        - name: jwks
+          configMap:
+            name: {{ . }}
+        {{- end }}
+        {{- with .Values.auth.jwt.jwksSecret }}
+        - name: jwks
+          secret:
+            secretName: {{ . }}
+        {{- end }}
+        {{- if .Values.tailscale.enabled }}
+        # Shared between the initContainer (writes the CLI binary), the
+        # tailscale sidecar (writes the control socket + state), and the
+        # cornus container (reads both). See values.yaml "tailscale".
+        - name: tailscale-bin
+          emptyDir: {}
+        - name: tailscale-socket
+          emptyDir: {}
+        # Not persisted across restarts — use a reusable, ephemeral-tagged
+        # auth key (see values.yaml "tailscale.authKeySecret").
+        - name: tailscale-state
+          emptyDir: {}
+        {{- end }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+    {{- if and .Values.fileCache.enabled .Values.fileCache.persistence.enabled }}
+    - metadata:
+        name: filecache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.fileCache.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.fileCache.persistence.size }}
+    {{- end }}

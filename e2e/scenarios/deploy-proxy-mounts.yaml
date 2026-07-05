@@ -1,0 +1,29 @@
+# Enforcing proxy + a client-local mount on the SAME service. pmclient is on the
+# `mesh` proxy network (all its egress is nftables-redirected into its caretaker)
+# AND has a client-local bind mount (served over 9P by the compose `up` helper).
+# The one privileged caretaker runs BOTH roles; because it must run as root for
+# the mount, it is exempted from the redirect by a firewall MARK, not by uid. The
+# mark also lets its 9P relay dial escape the redirect — so the mount coming up
+# live proves the mark exemption works.
+#
+# pmweb is a same-network peer (reachable); pmoutsider is on a plain network
+# (must be DENIED). Service names are distinct from the other proxy scenarios to
+# avoid shared-namespace headless-Service collisions.
+services:
+  pmweb:
+    image: nginx:alpine
+    networks: [mesh]
+  pmclient:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    volumes:
+      - ./deploy-proxy-mounts-data:/data:ro
+    networks: [mesh]
+  pmoutsider:
+    image: nginx:alpine
+    networks: [other]
+networks:
+  mesh:
+    driver_opts:
+      proxy: "true"
+  other:

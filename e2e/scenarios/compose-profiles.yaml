@@ -1,0 +1,10 @@
+# Compose profiles E2E fixture: `tools` is gated behind the "debug" profile;
+# `web` is always active. Public images so it runs on both the Docker host and
+# kind targets without a build step.
+name: e2eprof
+services:
+  web:
+    image: nginx:1.27-alpine
+  tools:
+    image: redis:7-alpine
+    profiles: [debug]

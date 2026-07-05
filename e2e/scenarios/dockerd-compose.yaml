@@ -1,0 +1,8 @@
+# Minimal compose project driven through the `cornus daemon docker` proxy by
+# dockerd.star. `docker compose -p dcomp up -d` makes the proxy create+start one
+# service container named dcomp-web-1, which becomes a cornus deploy of the same
+# name on the server. It stays alive so the deployment reports a ready replica.
+services:
+  web:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo COMPOSE_PROXY_UP; sleep infinity"]

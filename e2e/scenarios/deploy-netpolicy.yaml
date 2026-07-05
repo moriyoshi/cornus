@@ -1,0 +1,15 @@
+# Two services on an isolated network. driver_opts.policy=true makes the k8s
+# netdriver add the networkpolicy provider (on top of the services DNS
+# baseline), so a NetworkPolicy is emitted to isolate the network's members.
+services:
+  a:
+    image: nginx:alpine
+    networks: [isolated]
+  b:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [isolated]
+networks:
+  isolated:
+    driver_opts:
+      policy: "true"

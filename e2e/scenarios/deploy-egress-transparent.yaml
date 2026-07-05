@@ -1,0 +1,34 @@
+# Client-side egress, mode "transparent" (kube): all app TCP is captured by an
+# nftables REDIRECT and relayed by route. Three apps share a network with `web`
+# (nginx) and differ ONLY in their default egress route, so the SAME destination
+# (web's cluster Service) proves each route's distinct behavior:
+#   - cluster: egress directly from the pod's own network  -> reaches web
+#   - client : relay to the (out-of-cluster) client        -> cannot reach web
+#   - deny   : dropped                                      -> cannot reach web
+services:
+  web:
+    image: nginx:alpine
+    networks: [egrnet]
+  app-direct:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: transparent
+      default: cluster
+  app-relay:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: transparent
+      default: client
+  app-deny:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [egrnet]
+    x-cornus-egress:
+      mode: transparent
+      default: deny
+networks:
+  egrnet:

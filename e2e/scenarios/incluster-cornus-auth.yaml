@@ -1,0 +1,119 @@
+# Auth-enabled in-cluster cornus for the kube-auth E2E: same shape as
+# incluster-cornus.yaml but with JWT authentication ON, validating cluster-issued
+# ServiceAccount tokens against the cluster's own JWKS. incluster-kubeauth.star
+# fetches the live JWKS (kubectl get --raw /openid/v1/jwks) into the `cornus-jwks`
+# ConfigMap this Deployment mounts, and sets the audience the CLI's kube-auth
+# profile requests. Issuer is left unset (no iss constraint) so the scenario need
+# not parse the discovery document. Distinct resource names (…-auth) keep it
+# isolated from incluster-cornus.yaml.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cornus-auth
+  labels: {app: cornus-auth}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cornus-auth
+  labels: {app: cornus-auth}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pod subresources for server-proxied logs / exec / attach / port-forward
+  # (a subresource is a separate RBAC grant from "pods").
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cornus-auth
+  labels: {app: cornus-auth}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cornus-auth
+subjects:
+  - kind: ServiceAccount
+    name: cornus-auth
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cornus-auth
+  labels: {app: cornus-auth}
+spec:
+  selector: {app: cornus-auth}
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cornus-auth
+  labels: {app: cornus-auth}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cornus-auth}
+  template:
+    metadata:
+      labels: {app: cornus-auth}
+    spec:
+      serviceAccountName: cornus-auth
+      containers:
+        - name: cornus
+          image: cornus:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--addr", ":5000"]
+          ports:
+            - containerPort: 5000
+          env:
+            - name: CORNUS_DATA
+              value: /var/lib/cornus
+            - name: CORNUS_DEPLOY_BACKEND
+              value: kubernetes
+            - name: CORNUS_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Authenticate JWTs against the cluster's SA-token JWKS. The audience
+            # must match the kube-auth profile's --kube-auth-audience.
+            - name: CORNUS_JWT_JWKS_FILE
+              value: /etc/cornus/jwks/jwks.json
+            - name: CORNUS_JWT_AUDIENCE
+              value: cornus
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cornus
+            - name: jwks
+              mountPath: /etc/cornus/jwks
+              readOnly: true
+          readinessProbe:
+            httpGet: {path: /readyz, port: 5000}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: 5000}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: jwks
+          configMap:
+            name: cornus-jwks
