@@ -1,0 +1,24 @@
+# Two services on a `macvlan`-driver network. On kubernetes with Multus
+# present, the netdriver realises this as a NetworkAttachmentDefinition whose
+# CNI config is the macvlan plugin with the given parent (master) interface —
+# on kind that is the node container's default NIC, eth0 unless
+# E2E_MULTUS_PARENT overrides it. The plugin defaults to bridge mode, where
+# slaves of the same parent are switched against each other inside the macvlan
+# driver itself, so pod-to-pod traffic between the pinned static addresses
+# works without ever exiting the parent. (What macvlan can NOT do — kernel
+# semantics — is slave<->parent traffic, i.e. pod-to-node; nothing here relies
+# on that.) Service names are mmesh-scoped (ma/mb) so the shared-namespace
+# headless Services never collide with deploy-multus/-ipvlan's a/b.
+services:
+  ma:
+    image: nginx:alpine
+    networks: [mnet]
+  mb:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    networks: [mnet]
+networks:
+  mnet:
+    driver: macvlan
+    driver_opts:
+      master: ${E2E_MULTUS_PARENT:-eth0}

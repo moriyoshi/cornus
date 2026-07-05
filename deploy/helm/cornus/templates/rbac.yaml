@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+{{- if .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # One-shot / init compose services (restart: "no" or "on-failure") become
+  # Jobs instead of Deployments; see pkg/deploy/kubernetes/job.go.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Managed volumes become PersistentVolumeClaims: reconcile creates the PVC
+  # backing each volume (owned by the Deployment for anonymous volumes, un-owned
+  # for named ones), and `compose down --volumes` deletes named-volume PVCs.
+  # Without this grant, deploying any service with a volume fails at reconcile.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pod subresources proxied through the cornus server: logs (compose logs) and
+  # the streaming exec / attach / port-forward endpoints. A subresource is a
+  # separate RBAC grant from "pods", so these are required for `cornus compose
+  # logs`, `cornus exec`, and `cornus port-forward` to work server-side.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+  # Multi-replica hub (CORNUS_HUB_STORE=kube): the Kubernetes-native hub store
+  # writes provider records as HubEndpoint CRs and renews a per-replica Lease.
+  - apiGroups: ["cornus.dev"]
+    resources: ["hubendpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Leases serve two features: the multi-replica hub store's per-replica
+  # liveness Leases (random hashed names, so no resourceNames scoping is
+  # possible) and, when gc.lease is set, the single GC-coordination Lease
+  # (CORNUS_GC_LEASE needs only get/create/update on it, already covered here).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- with .Values.caretakerTlsSecret }}
+  # Caretaker sidecar TLS: the deploy backend inspects the TLS Secret's keys at
+  # deploy time (get only, pinned to this one Secret) to decide CA-only vs mTLS
+  # wiring. Mounting the Secret into sidecar pods needs no RBAC — the kubelet
+  # resolves the volume.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ . | quote }}]
+    verbs: ["get"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cornus.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cornus.fullname" . }}
+---
+# Cluster-scoped RBAC for the multi-replica hub store's CRD self-install. The
+# HubEndpoint CustomResourceDefinition is cluster-scoped, so creating (and reading)
+# it needs a ClusterRole. Only used when running the hub with
+# CORNUS_HUB_STORE=kube; harmless otherwise.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cornus.fullname" . }}-hub-crd
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cornus.fullname" . }}-hub-crd
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cornus.fullname" . }}-hub-crd
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cornus.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

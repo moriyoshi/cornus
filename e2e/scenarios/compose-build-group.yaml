@@ -1,0 +1,17 @@
+# Two services sharing an identical build: context/Dockerfile so cornus's
+# compose build-group dedup (cmd/cornus/internal/composecli: groupBuildRequests)
+# folds them into ONE BuildKit build: the first member's tag is that build's
+# primary target, and the second member's tag rides along as an additional tag
+# on the same build. Used by compose-build-group.star to regression-lock that
+# both members' tags are redirected to the co-located registry, not just the
+# first.
+name: cbgrp
+services:
+  svc-a:
+    build:
+      context: ./app-build
+    command: ["sh", "-c", "sleep infinity"]
+  svc-b:
+    build:
+      context: ./app-build
+    command: ["sh", "-c", "sleep infinity"]

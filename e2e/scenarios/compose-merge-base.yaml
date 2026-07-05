@@ -1,0 +1,11 @@
+# Multi-file deep-merge base. The override file (compose-merge-override.yaml)
+# adds/overrides individual environment keys; the base's MERGE_A must survive
+# (field-level deep merge, not whole-service replacement). Public image.
+name: cme
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    environment:
+      MERGE_A: base_a
+      MERGE_B: base_b

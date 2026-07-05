@@ -1,0 +1,10 @@
+# Fixture for socks5-mount.star: an nginx service `web` whose docroot is a
+# client-local bind mount (streamed over 9P), publishing NO ports. Deploys as
+# `smnt-web`. The mounted index.html carries a marker the scenario fetches THROUGH
+# the SOCKS5 proxy by the service's short/bare name.
+name: smnt
+services:
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./socks5-mount-data:/usr/share/nginx/html:ro

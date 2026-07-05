@@ -1,0 +1,295 @@
+image:
+  # Pre-built multi-arch (amd64/arm64) images are published to GHCR by the
+  # release workflow. Override for a locally built or mirrored image.
+  repository: ghcr.io/moriyoshi/cornus
+  # Empty tag defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Listen address inside the container.
+addr: ":5000"
+
+# Number of server replicas. The default (1) keeps the classic single-replica
+# behavior and renders exactly as before. Setting replicas > 1 switches the
+# workload-to-workload hub to its multi-replica mode: the chart sets
+# CORNUS_HUB_STORE=kube (provider records become HubEndpoint CRs, liveness a
+# per-replica Lease; the RBAC below already grants this), adds a headless
+# Service so each pod gets a stable per-pod DNS name, and points
+# CORNUS_HUB_FORWARD_URL at that name so peer replicas can dial this replica's
+# /.cornus/v1/hub/forward for cross-replica delivery.
+#
+# Requirements and caveats when replicas > 1:
+#   - storage MUST be an s3:// URL (enforced at render time). Each replica gets
+#     its own PVC, so a PVC-backed registry CAS would be inconsistent across
+#     replicas behind one Service.
+#   - The StatefulSet serviceName switches to the headless Service, and that
+#     field is immutable: moving an existing release between 1 and >1 replicas
+#     requires deleting the StatefulSet first (PVCs are retained).
+#   - With tls.enabled, inter-replica forward dials use wss:// and verify the
+#     serving certificate against the container's system trust store, so the
+#     cert must cover the per-pod names (*.<fullname>-hub.<namespace>.svc) and
+#     chain to a trusted root.
+#   - Garbage collection: gc.interval alone runs an uncoordinated mark-and-sweep
+#     on every replica over the shared s3 CAS. Set gc.lease: "kube" together
+#     with gc.interval so the replicas elect a single sweeper per tick through a
+#     coordination.k8s.io Lease (the RBAC below already grants this).
+replicas: 1
+
+# Periodic storage garbage collection. Both values render nothing when empty
+# (the default): no env vars, no behavior change — GC then only runs on-demand
+# via POST /.cornus/v1/gc.
+gc:
+  # CORNUS_GC_INTERVAL: a Go duration (e.g. "24h", "90m"). When set, every
+  # replica runs the storage mark-and-sweep GC on this period.
+  interval: ""
+  # CORNUS_GC_LEASE: opt-in cross-replica GC coordination; requires interval
+  # (enforced at render time). "kube" elects a single sweeper per tick through
+  # a coordination.k8s.io Lease named "cornus-gc" in the release namespace;
+  # "kube:<name>" or "kube:<namespace>/<name>" override the Lease identity.
+  # With this set, gc.interval is safe to enable with replicas > 1. The chart
+  # Role already grants the Lease verbs (shared with the multi-replica hub
+  # store; see rbac.yaml).
+  lease: ""
+
+# Automatic ingress defaults for workloads that opt into ingress
+# (DeploySpec.Ingress / compose `x-cornus-ingress`). These are the SERVER-SIDE
+# fallbacks: a workload that merely enables ingress gets "<name>.<domain>" on the
+# default class, with TLS via tlsIssuer. A client deploy/compose may override the
+# domain, class, and issuer per workload — unless enforceDomain pins the domain.
+# Leave every field empty (the default) to require each workload to specify its own
+# host, so nothing is auto-exposed.
+ingress:
+  # CORNUS_INGRESS_DOMAIN: base wildcard domain for host auto-derivation, e.g.
+  # "preview.example.com". Empty means no server default (a workload must set its
+  # own ingress.host or ingress.domain).
+  domain: ""
+  # CORNUS_INGRESS_CLASS: default IngressClassName. Empty uses the cluster default.
+  className: ""
+  # CORNUS_INGRESS_TLS_ISSUER: default cert-manager cluster-issuer for TLS-enabled
+  # ingresses. Empty means a TLS-requesting workload must supply its own secret/issuer.
+  tlsIssuer: ""
+  # CORNUS_INGRESS_ENFORCE_DOMAIN: when true (and domain is set), reject a workload
+  # whose resolved host falls outside `domain`, so a shared ingress controller cannot
+  # be made to serve an arbitrary hostname on a client's say-so.
+  enforceDomain: false
+
+# Registry persistence backend (CORNUS_STORAGE): a path, file://, mem://, or
+# s3://bucket?region=...&endpoint=...&path_style=... Empty (the default) keeps
+# the CAS on the data dir PVC. Must be an s3:// URL when replicas > 1 (shared
+# object storage); the PVC then still holds the per-replica build cache.
+storage: ""
+
+# Server-side per-file block cache for on-demand remote file reads over 9P
+# (immutable build contexts, and deploy mounts flagged immutable via
+# --local-mount SRC:DST:cache). Off by default; when enabled a chunk pulled once
+# is served from an on-disk cache under the data-dir PVC, so repeated builds of a
+# large context and workloads that repeatedly read an immutable mount skip
+# re-fetching bytes over the wire. Backing files live under CORNUS_DATA (the PVC)
+# and are pruned by the storage GC (POST /.cornus/v1/gc); size is exported as the OTel
+# gauge cornus.filecache.size.bytes.
+fileCache:
+  # Enable the cache (CORNUS_FILE_CACHE). false renders no env, behavior unchanged.
+  enabled: false
+  # Fixed chunk size in bytes (CORNUS_FILE_CACHE_CHUNK_SIZE). Empty uses the
+  # server default (1048576 = 1 MiB, matching the kernel-9p mount msize).
+  chunkSize: ""
+  # Soft on-disk size cap in bytes enforced by GC pruning
+  # (CORNUS_FILE_CACHE_MAX_BYTES). Empty/0 = no cap (TTL pruning still applies).
+  maxBytes: ""
+  # Dedicated volume for the cache. When enabled, the chart adds a separate PVC
+  # (its own size / storage class) mounted at /var/lib/cornus-filecache and points
+  # CORNUS_FILE_CACHE_DIR at it, so the cache does NOT share the data-dir PVC that
+  # holds the registry CAS + build cache — size or reset it independently, or put
+  # it on faster/cheaper storage. When disabled the cache lives under CORNUS_DATA
+  # (the data-dir PVC). Toggling this on an existing release adds a new
+  # volumeClaimTemplate, which is immutable on a StatefulSet, so it requires
+  # recreating the StatefulSet (kubectl delete sts --cascade=orphan; helm upgrade).
+  persistence:
+    enabled: false
+    size: 20Gi
+    # storageClassName: ""
+
+# Deploy backend for workloads created through /.cornus/v1/deploy. The chart runs
+# cornus in-cluster, so it deploys into its own namespace by default (the RBAC
+# below grants the verbs). Set to "dockerhost" only if the pod has a Docker
+# socket mounted.
+deployBackend: kubernetes
+
+service:
+  # Empty derives the type from registry.exposure (NodePort for nodePort, else
+  # ClusterIP). Set explicitly only to override that.
+  type: ""
+  port: 5000
+
+# CORNUS_ADVERTISE_URL: the in-cluster cornus URL that pod mount-agents and
+# caretaker sidecars dial back for the client-local mount / egress / credential
+# relays. Without it, those features error at request time (deploys that don't
+# use them are unaffected).
+advertise:
+  # true renders the env var; false omits it entirely (opt-out).
+  enabled: true
+  # Empty derives the server's own fully-qualified Service DNS name and port —
+  # ws(s)://<fullname>.<namespace>.svc:<service.port> (scheme follows tls.enabled).
+  # Set to override, e.g. when clients reach cornus through a different in-cluster
+  # name; use a ws:// or wss:// (or http/https) origin.
+  url: ""
+
+# How workloads' images are exposed for cluster nodes to pull. A deploy pull ref
+# must be resolvable AND pullable from every node, which the client's own control-
+# plane endpoint (a port-forward's localhost, an ingress host) is not. Cornus
+# advertises a node-reachable registry host via GET /.cornus/v1/info; the compose client
+# bakes it into the deploy spec instead of its endpoint host.
+registry:
+  # exposure selects the topology the server advertises and the chart wires:
+  #   nodePort    - Service type NodePort; nodes pull localhost:<nodePort>. Default.
+  #                 Auto-advertised from the Service (no advertiseHost needed).
+  #   clusterIP   - advertise the Service ClusterIP. Set advertiseHost (the Service
+  #                 alone is not a signal of intent). Needs the nodeCIDR allow under
+  #                 default-deny, and node trust for the ClusterIP.
+  #   hostPort    - bind the registry port on the node (needs CNI portmap). Set
+  #                 advertiseHost to <nodeIP>:<port> and pin the pod with
+  #                 nodeSelector. NetworkPolicy-immune.
+  #   hostNetwork - run the pod in the host netns (needs a privileged PodSecurity
+  #                 namespace). Set advertiseHost and pin the pod. NetworkPolicy-immune.
+  #   ingress     - advertise an ingress host/VIP. Set advertiseHost. Nodes must
+  #                 resolve the host and trust its cert (real DNS + TLS).
+  exposure: nodePort
+  # Fixed NodePort for nodePort exposure. A fixed port lets each node's containerd
+  # registry config (registries.yaml / hosts.toml) be pre-provisioned. Empty lets
+  # Kubernetes allocate one (then read it back from the Service).
+  nodePort: 30500
+  # hostPort for hostPort exposure (the node port the registry binds).
+  hostPort: 5000
+  # advertiseHost overrides the registry host baked into deploy pull refs
+  # (sets CORNUS_ADVERTISE_REGISTRY). REQUIRED for clusterIP / hostPort / hostNetwork
+  # / ingress, which the server cannot introspect from the Service alone. Prefix with
+  # https:// for a TLS registry; a bare host[:port] uses the server's own scheme.
+  advertiseHost: ""
+  # nodeCIDR, when set for nodePort/clusterIP exposure, emits a NetworkPolicy that
+  # lets nodes in this CIDR reach the registry port — required under a default-deny
+  # posture, since node-origin pull traffic presents a node IP no podSelector matches.
+  # hostPort/hostNetwork need no allow (a host-netns listener is not policy-governed).
+  nodeCIDR: ""
+
+persistence:
+  size: 20Gi
+  # storageClassName: ""
+
+# The in-process build engine needs runc + overlayfs. privileged is the simplest
+# posture; set to false and provide the rootless prerequisites for hardened
+# clusters (see README "Privilege posture").
+privileged: true
+
+# TLS is opt-in. When enabled, the server serves HTTPS from a mounted Secret
+# holding tls.crt / tls.key (and, for mTLS, ca.crt). cornus hot-reloads the cert
+# on file change, so an external rotator renews it in place without a restart.
+tls:
+  enabled: false
+  # Secret mounted at /etc/cornus/tls. When certManager is enabled this Secret is
+  # produced by cert-manager; otherwise provide an existing one with the same keys.
+  secretName: cornus-tls
+  # Verify client certificates (mTLS) using ca.crt from the Secret. A verified
+  # cert's CommonName becomes the caller identity (see CORNUS_API_POLICY).
+  clientCA: false
+  # Opt-in cert-manager integration: render a Certificate that writes secretName,
+  # and let cert-manager issue + rotate it. Requires cert-manager installed and an
+  # Issuer/ClusterIssuer.
+  certManager:
+    enabled: false
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer # or Issuer
+    # DNS names for the cert; defaults to the in-cluster Service name when empty.
+    dnsNames: []
+    duration: 2160h # 90d
+    renewBefore: 720h # 30d — cert-manager renews here; cornus hot-reloads the new cert
+
+# Opt-in JWT verification for the server API (kube-auth turnkey path). Each set
+# value renders the matching CORNUS_JWT_* env on the server container; leaving
+# everything empty renders nothing (auth stays off unless configured elsewhere).
+auth:
+  jwt:
+    # HTTPS URL of a JWKS document (CORNUS_JWT_JWKS_URL), e.g. the cluster's
+    # ServiceAccount OIDC JWKS. Mutually exclusive with jwksConfigMap/jwksSecret
+    # (the server rejects both being set; the chart fails at render time).
+    jwksURL: ""
+    # Alternatively, mount a user-provided JWKS document and point
+    # CORNUS_JWT_JWKS_FILE at it. Set exactly one of jwksConfigMap / jwksSecret
+    # to the name of an existing ConfigMap or Secret in the release namespace;
+    # jwksKey is the key inside it holding the JWKS JSON. Mounted read-only at
+    # /etc/cornus/jwks.
+    jwksConfigMap: ""
+    jwksSecret: ""
+    jwksKey: "jwks.json"
+    # Required audience (aud) claim (CORNUS_JWT_AUDIENCE). Tokens minted by
+    # cornus kube-auth must use the same audience.
+    audience: ""
+    # Optional expected issuer (iss) claim (CORNUS_JWT_ISSUER). Unset skips the
+    # issuer check.
+    issuer: ""
+
+# TLS for caretaker sidecars (CORNUS_CARETAKER_TLS_SECRET): the name of an
+# existing Secret in the release namespace whose material server-bound caretaker
+# sidecars (mount / hub roles) present when dialing the server. Keys follow the
+# kubernetes.io/tls convention: ca.crt (a PEM CA bundle added to the system
+# roots — use this when tls.enabled serves a private-CA certificate) and,
+# optionally, tls.crt / tls.key (an mTLS client pair, for tls.clientCA). The
+# kubernetes deploy backend mounts the Secret read-only into every server-bound
+# sidecar and points the embedded caretaker config at the mounted paths; a
+# CA-only Secret enables server-auth TLS without mTLS (the client-pair paths are
+# omitted). Empty (the default) renders nothing and sidecar pod specs stay
+# exactly as before.
+caretakerTlsSecret: ""
+
+# Grant RBAC for the in-cluster kubernetes deploy backend and, when replicas > 1,
+# the kube-native hub store (HubEndpoint CRs, Leases, CRD self-install). The
+# Lease verbs also cover the gc.lease GC-coordination Lease.
+rbac:
+  create: true
+
+resources: {}
+
+# Opt-in Tailscale Funnel sidecar for the `tailscale` tunnel backend
+# (CORNUS_TUNNEL_BACKEND=tailscale; see docs/guides/tunnels.md). `tailscale
+# funnel` needs a node already joined to a tailnet — `sudo tailscale up` isn't
+# something you can run by hand against an ephemeral pod, so this runs
+# `tailscaled` as a sidecar container that joins unattended via an authkey
+# Secret, and an initContainer that copies the `tailscale` CLI binary onto a
+# volume shared with the cornus container, so no custom cornus image is
+# needed. The sidecar runs in userspace networking mode (no NET_ADMIN, no TUN
+# device) since Funnel only needs to proxy a local port through tailscaled's
+# control connection. Off by default; enabling it sets CORNUS_TUNNEL_BACKEND,
+# CORNUS_TUNNEL_TAILSCALE_BIN, and TS_SOCKET on the cornus container for you.
+tailscale:
+  enabled: false
+  image:
+    repository: ghcr.io/tailscale/tailscale
+    tag: stable
+    pullPolicy: IfNotPresent
+  # Required when enabled: name of an existing Secret in the release namespace
+  # holding a tailnet auth key under authKeySecretKey. The sidecar's state
+  # directory is an emptyDir (not persisted across pod restarts/rescheduling),
+  # so use a REUSABLE, pre-approved auth key — ideally tagged ephemeral so
+  # nodes from prior pod incarnations expire automatically instead of
+  # accumulating in the tailnet admin console. Create one with, e.g.:
+  #   kubectl create secret generic cornus-tailscale-authkey \
+  #     --from-literal=authkey=tskey-auth-...
+  authKeySecret: ""
+  authKeySecretKey: authkey
+  # TS_HOSTNAME: the tailnet device name, so the Funnel URL
+  # (https://<hostname>.<tailnet>.ts.net/) is stable across restarts. Empty
+  # derives it from the release fullname.
+  hostname: ""
+  # Extra flags appended to the sidecar's unattended `tailscale up`
+  # (TS_EXTRA_ARGS), e.g. "--accept-dns=false". The chart already supplies
+  # --authkey (from the Secret) and --hostname.
+  extraArgs: ""
+  resources: {}
+
+nodeSelector: {}
+tolerations: []
+# Pod affinity, rendered verbatim when set. When empty and replicas > 1 the
+# chart renders a default preferred (soft) pod anti-affinity that spreads
+# replicas across nodes but still schedules on single-node clusters; setting
+# affinity here replaces that default entirely.
+affinity: {}

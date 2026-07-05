@@ -1,0 +1,294 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede an in-flight run for the same ref (PR branch or main push) so rapid
+  # successive pushes don't pile up parallel, redundant CI runs.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Standard gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go build (cloudblob storage drivers)
+        # The gs:// / azblob:// gocloud drivers are behind the `cloudblob` build tag
+        # (they pull the Google/Azure SDKs). Compile that path so it does not rot,
+        # without pulling the drivers into the default binary.
+        run: go build -tags cloudblob ./pkg/storage/...
+
+      - name: go build (E2E FTP server fixture)
+        # The ftp*.star scenarios build this Go FTP server (fclairamb/ftpserverlib).
+        # It is a nested module (kept out of the main go.mod), so compile it
+        # explicitly here so it does not rot.
+        run: cd e2e/scenarios/ftp && go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build + test (otelcol embedded collector)
+        # The workload OpenTelemetry Collector is behind the `otelcol` build tag (it
+        # pulls the collector-core dependency tree); the default gate above only
+        # compiles the stub. Build + test the real collector path so it does not rot
+        # and the released image (which ships with the tag) stays green.
+        run: make test-otel
+
+      - name: E2E scenario syntax check
+        run: make e2e-check
+
+  # Validates the in-repo yamux QoS fork and its performance/emulation harnesses,
+  # none of which the standard gate exercises: the fork is a nested module (go.mod's
+  # `replace` target) whose own tests the main `go test ./...` never runs, and the
+  # qosab / netemab harnesses are benchmarks + a nested gVisor module. Runs in
+  # parallel with `gate` so its (heavier) netem step never slows the critical gate.
+  qos:
+    name: QoS transport (yamux fork + netem)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          # Key the module + build cache on every module's go.sum so the netem
+          # step's one-time gVisor compile is reused across runs and re-runs only
+          # when a pin changes. third_party/yamux has no deps (empty go.sum).
+          cache-dependency-path: |
+            go.sum
+            third_party/yamux/go.sum
+            pkg/wire/qosab/netemab/go.sum
+            pkg/wire/sqliteab/go.sum
+
+      - name: yamux fork unit tests (race; QoS priority/frame-cap + upstream suite)
+        # The fork is a nested module, so the main `go test ./...` never runs its
+        # own tests. Run them here: the QoS additions (SetPriority/SetMaxWindow
+        # clamps + scheduler) plus the full upstream yamux suite, so a fork change
+        # that breaks either the new behavior or core yamux fails CI. `-race`
+        # matches upstream yamux's own CI and guards the scheduler concurrency the
+        # fork introduced (sendLoop / class-aware send path).
+        #
+        # `-short` here is deliberate: the multi-GiB throughput tests
+        # (TestSendData_Large / _VeryLarge) self-skip under -short because they
+        # "may time out on the race detector" — under `-race` on a contended CI
+        # runner they exceed their internal 120s deadline. The scheduler
+        # concurrency the race detector is here to guard is still fully exercised
+        # by the rest of the suite; the big transfers get their own non-race pass
+        # below.
+        run: cd third_party/yamux && go test -race -short ./...
+
+      - name: yamux fork throughput/integrity (no race; full transfer sizes)
+        # Companion to the -race -short pass above: run the whole suite WITHOUT the
+        # race detector so the multi-GiB throughput/integrity tests that -short
+        # skips (TestSendData_Large, full-size batched integrity) actually execute.
+        # Without -race these finish in seconds instead of timing out, so the fork's
+        # bulk send path stays covered.
+        #
+        # TestSendData_VeryLarge (1 GiB x 16 workers) is -skip'd here: on shared
+        # GitHub-hosted runners it contends with the concurrent image build and CLI
+        # matrix, starving the transfer goroutines until yamux's keepalive/write
+        # safety-valve trips ("keepalive failed: i/o deadline reached") — a runner
+        # timing flake, not a fork regression. It still runs locally (plain
+        # `go test ./...` in third_party/yamux), and TestSendData_Large keeps the
+        # bulk path covered in CI.
+        run: cd third_party/yamux && go test -skip '^TestSendData_VeryLarge$' ./...
+
+      - name: qosab in-process QoS harness smoke (run each benchmark once)
+        # qosab lives in the main module (so the gate compile-checks it), but its
+        # benchmarks never execute there. `-benchtime 1x` runs each once over the
+        # in-process link simulator to catch runtime panics/deadlocks in the
+        # scheduler + link across the full variant x profile matrix, cheaply.
+        run: go test -run '^$' -bench . -benchtime 1x ./pkg/wire/qosab/
+
+      - name: netemab tests (yamux QoS over a real TCP stack on emulated L3 links)
+        # Nested module so ooni/netem's heavy gVisor userspace-netstack dependency
+        # stays out of the main go.mod. The matrix tests are measurement-driven, so
+        # they guard against compile/API breaks vs gVisor/netem and against the fork
+        # failing to establish sessions over real TCP (delay/loss/bandwidth/MTU).
+        # First run compiles gVisor (cached by setup-go on later runs).
+        run: cd pkg/wire/qosab/netemab && go test -timeout 10m ./...
+
+      - name: sqliteab tests (real SQLite over the block-protocol transport)
+        # Nested module (cgo mattn/go-sqlite3 + a psanford/sqlite3vfs VFS) so its
+        # heavy SQLite amalgamation stays out of the main go.mod. Runs a real
+        # SQLite workload over ServeBlockProxy/ServeBlockServer on the yamux fork
+        # (both send paths): the TestSQLite correctness cases prove the block
+        # proxy is coherent under a database's page-write/fsync pattern (integrity
+        # ok in-mount AND on the authoritative on-disk file), and a one-shot bench
+        # smoke catches runtime panics in the insert workload cheaply.
+        run: cd pkg/wire/sqliteab && go test -run TestSQLite -bench . -benchtime 1x -timeout 10m ./...
+
+  # Executes the opt-in, emulator/mock-backed storage and credential backends that
+  # the standard gate only COMPILE-checks: registry storage over S3 / GCS / Azure
+  # and the aws-sts credential source. All four run in ONE tagged `go test`
+  # (`credaws` + `cloudblob` compose) against three local emulators — winterbaume
+  # (one binary serving both S3 and STS), fake-gcs-server, and Azurite — so no
+  # cloud account or network egress to AWS/GCP/Azure is needed. The same tests
+  # self-skip in the standard gate (no endpoints set); here the endpoints are
+  # provisioned, so they execute. See .agents/docs/TESTING.md.
+  integration-backends:
+    name: Integration backends (S3 / STS / GCS / Azure emulators)
+    runs-on: ubuntu-24.04
+    env:
+      # Pinned winterbaume release + checksum (>= v0.2.5 required for S3 gzip
+      # layers; see .agents/docs/LTM/registry-and-storage.md). x86_64 runner.
+      WB_VERSION: v0.2.5
+      WB_ASSET: winterbaume-server-x86_64-unknown-linux-gnu.tar.xz
+      WB_SHA256: adb0334950d5c067eff0ba75918fca81f1a0dca70394dfd82ba05ad588467fec
+      WB_DIR: winterbaume-server-x86_64-unknown-linux-gnu
+      # Emulator images pinned by manifest-list (index) digest — reproducible and
+      # the stable key for the image cache below. Multi-arch, so the same digest
+      # resolves on the x86_64 runner.
+      GCS_IMAGE: fsouza/fake-gcs-server@sha256:3730da0e31f7e5186a90ec4899dc2c336104e7599df400411392ef17e684c31f
+      AZ_IMAGE: mcr.microsoft.com/azure-storage/azurite@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Cache the pinned winterbaume binary (keyed on the release version) and the
+      # pinned emulator images (keyed on their digests), so a run re-downloads /
+      # re-pulls only when a pin changes.
+      - name: Cache winterbaume binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.WB_DIR }}
+          key: winterbaume-${{ env.WB_VERSION }}-linux-x86_64
+
+      - name: Cache emulator images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: emu-images.tar
+          key: emulator-images-${{ env.GCS_IMAGE }}-${{ env.AZ_IMAGE }}
+
+      - name: Start emulators (winterbaume S3+STS, fake-gcs-server, Azurite)
+        run: |
+          set -euo pipefail
+
+          # AWS S3 + STS: one winterbaume binary serves both. Download + verify only
+          # on a cache miss; otherwise the cached binary is already present.
+          if [ ! -x "$WB_DIR/winterbaume-server" ]; then
+            curl -fsSL -o "$WB_ASSET" \
+              "https://github.com/moriyoshi/winterbaume/releases/download/winterbaume-server-${WB_VERSION}/${WB_ASSET}"
+            echo "${WB_SHA256}  ${WB_ASSET}" | sha256sum -c -
+            tar xf "$WB_ASSET"
+          fi
+          nohup "./$WB_DIR/winterbaume-server" --host 127.0.0.1 --port 5555 > winterbaume.log 2>&1 &
+          disown
+
+          # Emulator images: docker load from the cached tarball on a hit, else pull
+          # the pinned digests and save the tarball for the cache to persist. Both
+          # paths leave the images under fixed local tags used by docker run below.
+          if [ -f emu-images.tar ]; then
+            docker load -i emu-images.tar
+          else
+            docker pull "$GCS_IMAGE"
+            docker pull "$AZ_IMAGE"
+            docker tag "$GCS_IMAGE" gcs-emul:pinned
+            docker tag "$AZ_IMAGE" az-emul:pinned
+            docker save gcs-emul:pinned az-emul:pinned -o emu-images.tar
+          fi
+
+          # GCS via fake-gcs-server.
+          docker run -d --name gcs-emul -p 127.0.0.1:4443:4443 gcs-emul:pinned \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443
+
+          # Azure Blob via Azurite (--skipApiVersionCheck required by the SDK).
+          docker run -d --name az-emul -p 127.0.0.1:10000:10000 az-emul:pinned \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+
+          # Wait for all three to accept connections (curl w/o -f: any HTTP reply = up).
+          wait_up() { for _ in $(seq 1 100); do curl -s -o /dev/null "$1" && return 0; sleep 0.3; done; echo "timeout: $1" >&2; return 1; }
+          wait_up "http://127.0.0.1:5555/"
+          wait_up "http://127.0.0.1:4443/storage/v1/b?project=test"
+          wait_up "http://127.0.0.1:10000/devstoreaccount1"
+
+          # Pre-create the GCS bucket and Azure container (S3 self-creates its bucket).
+          curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
+            -H 'Content-Type: application/json' -d '{"name":"test-bucket"}' -o /dev/null
+          # devstoreaccount1 is Azurite's PUBLIC well-known dev credential (commit-safe).
+          az storage container create --name test-container \
+            --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+
+      - name: go test (S3 / STS / GCS / Azure over emulators)
+        env:
+          # AWS S3 + STS (winterbaume) with static test credentials.
+          CORNUS_TEST_S3_ENDPOINT: http://127.0.0.1:5555
+          CORNUS_TEST_STS_ENDPOINT: http://127.0.0.1:5555
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          # GCS (fake-gcs-server).
+          STORAGE_EMULATOR_HOST: 127.0.0.1:4443
+          CORNUS_TEST_GCS: gs://test-bucket
+          # Azure Blob (Azurite).
+          AZURE_STORAGE_ACCOUNT: devstoreaccount1
+          AZURE_STORAGE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+          AZURE_STORAGE_DOMAIN: 127.0.0.1:10000
+          AZURE_STORAGE_PROTOCOL: http
+          AZURE_STORAGE_IS_LOCAL_EMULATOR: "true"
+          CORNUS_TEST_AZBLOB: azblob://test-container
+        run: go test -tags "credaws cloudblob" -run 'S3|STS|GCS|Azblob' ./pkg/storage/ ./pkg/credential/awssts/
+
+  helm:
+    name: Helm chart lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: helm lint
+        run: helm lint deploy/helm/cornus
+
+      - name: helm template (default + TLS/cert-manager)
+        run: |
+          # Render both the default (TLS off) and the opt-in cert-manager path so a
+          # template regression fails CI even without a cluster.
+          helm template deploy/helm/cornus >/dev/null
+          helm template deploy/helm/cornus \
+            --set tls.enabled=true \
+            --set tls.clientCA=true \
+            --set tls.certManager.enabled=true \
+            --set tls.certManager.issuerRef.name=ci-issuer >/dev/null

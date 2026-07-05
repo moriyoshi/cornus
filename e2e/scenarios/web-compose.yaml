@@ -1,0 +1,15 @@
+# Fixture for web.star: a 2-service project with a depends_on edge (web -> cache)
+# and a named volume, so the web UI BFF has a dependency graph and a mount to
+# report. Public images, so it runs on every target without a build. A named
+# volume (not a bind) keeps it portable across docker/containerd/kube.
+name: webe2e
+services:
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - cachedata:/data
+  web:
+    image: nginx:1.27-alpine
+    depends_on: [cache]
+volumes:
+  cachedata: {}

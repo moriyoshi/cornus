@@ -1,0 +1,20 @@
+.DS_Store
+Thumbs.db
+__MACOSX
+/cornus
+/cornus.exe
+/bin/
+/data/
+/cornus-data/
+*.test
+*.out
+
+# VitePress docs site
+/docs/node_modules/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
+
+# Web UI (SolidJS app in web/, built into pkg/webui/dist for //go:embed)
+/web/node_modules/
+/pkg/webui/dist/*
+!/pkg/webui/dist/.gitkeep

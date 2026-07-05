@@ -1,0 +1,11 @@
+# G1: client-side egress leaves through the CLIENT's OWN proxy. mode=proxy; the app's
+# egress default-routes to `client`, so each relayed destination is dialed by the held
+# client session — which the scenario points at an in-process harness SOCKS5 proxy via
+# ALL_PROXY. The scenario then asserts the harness proxy recorded the destination.
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    x-cornus-egress:
+      mode: proxy
+      default: client

@@ -1,0 +1,67 @@
+# Default agent-detection rules for `cornus web`'s terminal session monitor.
+#
+# Each [[rule]] is matched (Go/RE2 regexp) against the rendered bottom buffer of a
+# session's screen once its output has gone quiet. Two states are detectable:
+#
+#   state = "blocked"  the program is waiting for a human (approval/permission/
+#                      question prompt). This pulls attention, so keep these
+#                      conservative — match only clearly interactive prompts.
+#   state = "working"  the program is still busy even though output paused (a
+#                      persistent "thinking…" / progress indicator). Active output
+#                      already reads as working on its own; these cover the quiet-
+#                      but-busy case.
+#
+# An optional `agent` field scopes a rule to one program (basename of the launched
+# command, e.g. "claude"); omit it to apply to every session.
+#
+# Users can extend (not replace) these with files under
+# ~/.config/cornus/agent-detection/*.toml. A malformed file or pattern is skipped
+# with a warning, never fatal. These patterns are cornus's own.
+
+# ---- blocked: waiting on a human -------------------------------------------
+
+[[rule]]
+state = "blocked"
+pattern = '(?i)\bdo you want to\b[^\n]*\?'
+
+[[rule]]
+state = "blocked"
+pattern = '(?i)\[y/n\]|\(y/n\)|\[yes/no\]|\by/n\b'
+
+# An arrow selector on a numbered choice = an interactive menu awaiting a pick
+# (e.g. Claude Code / inquirer-style "❯ 1. Yes").
+[[rule]]
+state = "blocked"
+pattern = '(?m)^\s*❯\s*\d+[.)]\s+\S'
+
+[[rule]]
+state = "blocked"
+pattern = '(?i)\(use arrow keys\)'
+
+[[rule]]
+state = "blocked"
+pattern = '(?i)press (enter|any key|return) to (continue|proceed)'
+
+[[rule]]
+state = "blocked"
+pattern = '(?im)\b(overwrite|replace|delete|proceed|continue)\b[^\n]*\?\s*$'
+
+# A trailing password/passphrase prompt is a session blocked on the user.
+[[rule]]
+state = "blocked"
+pattern = '(?im)(password|passphrase)[^\n]*:\s*$'
+
+# ---- working: busy even while output is momentarily quiet -------------------
+
+[[rule]]
+state = "working"
+pattern = '(?i)esc to interrupt'
+
+[[rule]]
+state = "working"
+pattern = '(?i)(thinking|working|generating|processing|compiling|building|installing|downloading|loading)(…|\.\.\.)'
+
+# A braille spinner frame left on the quiet screen.
+[[rule]]
+state = "working"
+pattern = '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]'

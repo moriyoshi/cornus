@@ -1,0 +1,12 @@
+Cornus
+Copyright 2026 Moriyoshi Koizumi
+
+This product includes software developed by Moriyoshi Koizumi and the
+Cornus contributors, licensed under the Apache License, Version 2.0.
+
+This product bundles third-party components. The distributed binary includes
+software under the Apache License 2.0, the MIT, ISC and BSD licenses, and the
+Mozilla Public License 2.0 (MPL-2.0). The MPL-2.0 components include a modified
+copy of github.com/hashicorp/yamux, vendored under third_party/yamux/ with its
+original license retained. See THIRD_PARTY_NOTICES.md for the full list of
+components, their versions and licenses, and the complete license texts.
