@@ -1,0 +1,12 @@
+# An nginx service whose x-cornus-ingress requests TLS, for the emulate-mode
+# TLS-termination E2E: the emulated ingress serves :443 with a generated cert and
+# reverse-proxies to the workload. Public image (no build); docker + kube.
+name: e2e
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    x-cornus-ingress:
+      host: app.native-cert.example.test
+      tls: {}

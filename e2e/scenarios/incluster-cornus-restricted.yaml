@@ -1,0 +1,117 @@
+# In-cluster cornus for the PERMISSION PREFLIGHT E2E: the server runs under a Role
+# that grants every deploy resource EXCEPT networking.k8s.io/ingresses, so its
+# startup preflight (SelfSubjectAccessReview per grant it needs; see
+# pkg/deploy/kubernetes/preflight.go) must report exactly the missing ingresses
+# grant as an optional-feature gap — and NOTHING as a required-permission gap, since
+# every core grant is present. incluster-preflight.star reads this server's own logs
+# and asserts both. Separate name/namespace-agnostic from incluster-cornus.yaml so
+# the two can coexist. cornus:e2e image, loaded into kind by prepare_kube.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cornus-preflight
+  labels: {app: cornus-preflight}
+---
+# Deliberately MISSING the networking.k8s.io/ingresses grant (and it does not need
+# secrets — no inline-TLS test here), so the preflight has exactly one gap to report.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cornus-preflight
+  labels: {app: cornus-preflight}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cornus-preflight
+  labels: {app: cornus-preflight}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cornus-preflight
+subjects:
+  - kind: ServiceAccount
+    name: cornus-preflight
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cornus-preflight
+  labels: {app: cornus-preflight}
+spec:
+  selector: {app: cornus-preflight}
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cornus-preflight
+  labels: {app: cornus-preflight}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cornus-preflight}
+  template:
+    metadata:
+      labels: {app: cornus-preflight}
+    spec:
+      serviceAccountName: cornus-preflight
+      containers:
+        - name: cornus
+          image: cornus:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--addr", ":5000"]
+          ports:
+            - containerPort: 5000
+          env:
+            - name: CORNUS_DATA
+              value: /var/lib/cornus
+            # The preflight only runs for a configured kubernetes backend.
+            - name: CORNUS_DEPLOY_BACKEND
+              value: kubernetes
+            - name: CORNUS_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The optional-feature gap logs at INFO — make sure INFO is emitted.
+            - name: CORNUS_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cornus
+          readinessProbe:
+            httpGet: {path: /readyz, port: 5000}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: 5000}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: data
+          emptyDir: {}

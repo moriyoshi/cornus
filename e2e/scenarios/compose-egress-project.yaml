@@ -1,0 +1,20 @@
+# Project-level `x-cornus-egress:` default (env mode). Every service without its own
+# `x-cornus-egress:` block inherits this default; a service that declares one fully
+# overrides it (no field-level merge). Distinct proxy URLs let the scenario tell the
+# inherited default from an override. `x-`-prefixed so the file stays valid compose.
+x-cornus-egress:
+  mode: env
+  proxies:
+    HTTP_PROXY: "http://project-proxy.example:8080"
+    NO_PROXY: "10.0.0.0/8"
+services:
+  inherits:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+  overrides:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    x-cornus-egress:
+      mode: env
+      proxies:
+        HTTP_PROXY: "http://override-proxy.example:9090"

@@ -1,0 +1,13 @@
+# `cornus compose` bind-mount coverage. The cornus image doubles as the app
+# (kept alive with sleep) and the mount-agent sidecar image. The bind source is
+# relative to this file's directory and is streamed over 9P (never a hostPath).
+name: cmnt
+services:
+  app:
+    image: cornus:e2e
+    # cornus:e2e's ENTRYPOINT is `cornus`; override it with a plain sleep so the
+    # app just idles as a mount target (a bare `command:` would run `cornus sleep`).
+    entrypoint: ["sleep"]
+    command: ["3600"]
+    volumes:
+      - ./compose-mounts-data:/data:ro

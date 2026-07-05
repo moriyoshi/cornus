@@ -1,0 +1,24 @@
+{{- if gt (int .Values.replicas) 1 }}
+# Headless governing Service for the multi-replica hub: gives each replica the
+# stable per-pod DNS name (<pod>.<fullname>-hub.<namespace>.svc) that its
+# CORNUS_HUB_FORWARD_URL advertises, so peer replicas can dial this replica's
+# /.cornus/v1/hub/forward for cross-replica delivery. Client traffic keeps using the
+# regular ClusterIP Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cornus.fullname" . }}-hub
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Publish pods before readiness so per-pod DNS resolves during startup; the
+  # forward dial itself still fails until the peer serves.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "cornus.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+{{- end }}

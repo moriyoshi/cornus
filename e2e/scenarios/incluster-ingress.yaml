@@ -1,0 +1,21 @@
+# A workload with a NATIVE (real) x-cornus-ingress AND a managed volume, deployed
+# through an IN-CLUSTER cornus server that runs under a restrictive RBAC Role (not
+# the host target's admin kubeconfig). Plain `compose up` (no --ingress-conduit), so
+# the ingress is NOT client-emulated: the deploy backend creates a real cluster
+# Ingress object fronting the Service, plus a PVC for the volume. Both require RBAC
+# grants the incluster Role must carry — see incluster-ingress.star.
+name: iclingress
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "80"
+    volumes:
+      - data:/usr/share/nginx/html
+    x-cornus-ingress:
+      hosts:
+        - web.incluster.example.test
+      path: /
+      path_type: Prefix
+volumes:
+  data:

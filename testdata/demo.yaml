@@ -1,0 +1,9 @@
+name: demo
+image: localhost:5000/demo:v1
+replicas: 1
+restart: unless-stopped
+env:
+  GREETING: hello
+ports:
+  - host: 8080
+    container: 80

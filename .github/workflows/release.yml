@@ -1,0 +1,350 @@
+name: Release
+
+# On a v* tag this workflow produces a full release:
+#   * multi-arch cornus image to GHCR
+#       ghcr.io/<owner>/cornus:<semver>  (plus :latest and :<major>.<minor>)
+#   * the Helm chart as an OCI artifact to GHCR (cosign-signed, keyless):
+#       oci://ghcr.io/<owner>/charts/cornus:<semver>
+#   * a GitHub Release carrying the prebuilt static CLI binaries the README's
+#     quick start downloads:
+#       cornus-linux-amd64, cornus-linux-arm64
+#     plus darwin/windows binaries, a SHA256SUMS manifest, and its keyless
+#     cosign signature (SHA256SUMS.sig + SHA256SUMS.pem). The pushed image
+#     manifest is also cosign-signed (keyless, GitHub OIDC).
+# workflow_dispatch also builds the image (for a manual :edge-style rebuild) but
+# only tag pushes publish a GitHub Release.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One release run per ref. Do NOT cancel a run mid-publish — a half-pushed GHCR
+  # image or partial GitHub Release is worse than waiting — so queue rather than
+  # supersede. Tags are unique, so this only ever engages on a manual re-dispatch.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and push image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      # Keyless cosign signing of the pushed image (GitHub OIDC).
+      id-token: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cornus
+          # latest=auto adds :latest on semver tags only.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=ref,event=pr
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Stamp main.version so `cornus version` in the image reports the
+          # release version, matching the standalone binaries below.
+          # steps.meta.outputs.version is the stripped semver on tag pushes
+          # (same value as ${GITHUB_REF_NAME#v} used by the binaries job).
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image (keyless)
+        # Signs the multi-arch manifest list by digest, which covers every tag
+        # pointing at it. Keyless: the signing certificate is bound to this
+        # workflow's GitHub OIDC identity and recorded in the Rekor log.
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cornus"
+          cosign sign --yes "${image}@${DIGEST}"
+
+  chart:
+    name: Publish Helm chart
+    # Only version tags publish a chart (same gate as the binaries job):
+    # workflow_dispatch rebuilds the image but must not overwrite a chart.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      # Keyless cosign signing of the pushed chart (GitHub OIDC).
+      id-token: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR (helm)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+
+      - name: Log in to GHCR (docker)
+        # helm registry login writes helm's own registry config, which cosign
+        # does not read: cosign authenticates from the docker config
+        # (~/.docker/config.json). Without this the `cosign sign` below fails
+        # uploading the signature layer to GHCR with UNAUTHORIZED. Same login
+        # the image job uses so cosign can push the chart signature.
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and push chart
+        # Both the chart version and appVersion are overridden to the release
+        # tag's semver — the same value the image job tags the pushed image
+        # with (steps.meta version) and the binaries job stamps into the CLI —
+        # so `helm install oci://.../charts/cornus --version <semver>` deploys
+        # ghcr.io/<owner>/cornus:<semver> without a per-release Chart.yaml
+        # commit. The checked-in Chart.yaml version only tracks chart-only
+        # changes between releases.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          helm package deploy/helm/cornus \
+            --version "${version}" \
+            --app-version "${version}" \
+            --destination dist
+          # helm push prints "Digest: sha256:..." on success; capture it so
+          # cosign signs exactly the artifact that was pushed.
+          helm push "dist/cornus-${version}.tgz" "oci://ghcr.io/${owner}/charts" \
+            |& tee push.log
+          digest="$(sed -n 's/^Digest: //p' push.log)"
+          if [ -z "${digest}" ]; then
+            echo "::error::helm push did not report a digest" >&2
+            exit 1
+          fi
+          cosign sign --yes "ghcr.io/${owner}/charts/cornus@${digest}"
+
+  webui:
+    name: Build web UI assets
+    # The released CLI binaries embed the web UI (pkg/webui //go:embed dist). The
+    # image job builds it inside the Dockerfile; the standalone binaries below are
+    # a bare `go build`, so build the assets ONCE here (arch-independent) and share
+    # them with every binaries matrix job via an artifact. Same tag gate as the
+    # binaries job it feeds.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload web UI assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: webui-dist
+          path: pkg/webui/dist
+          if-no-files-found: error
+
+  binaries:
+    name: Build CLI binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    # Only version tags produce downloadable release binaries.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Wait for the shared web UI build so `go build` embeds the real SPA.
+    needs: webui
+    runs-on: ubuntu-24.04
+    strategy:
+      # One static, CGO-free cross-compile per OS/arch. The build engine
+      # (pkg/build/builder) is linux-only behind //go:build linux; cmd/cornus
+      # stubs it out elsewhere, so darwin/windows compile the CLI without it.
+      # Windows artifacts carry a .exe suffix (ext); the others none.
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, ext: "" }
+          - { goos: linux, goarch: arm64, ext: "" }
+          - { goos: darwin, goarch: amd64, ext: "" }
+          - { goos: darwin, goarch: arm64, ext: "" }
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+          - { goos: windows, goarch: arm64, ext: ".exe" }
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        # cache:false — setup-go's built-in cache keys the module AND build cache
+        # under one go.sum-derived key with no GOOS/GOARCH component, so all six
+        # cross-compile matrix legs would race on a single key and 5 of 6 restore
+        # a build cache compiled for the wrong target. Cache the two directories
+        # explicitly below instead: the module cache shared (arch-independent),
+        # the build cache keyed per target.
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go module download
+        # Downloaded modules are source, identical across every target, so one
+        # shared key serves all matrix legs. restore-keys lets a go.sum bump reuse
+        # the previous cache as a warm base rather than starting cold.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            gomod-
+
+      - name: Cache Go build (${{ matrix.goos }}/${{ matrix.goarch }})
+        # The compiler build cache IS target-specific, so it gets its own key per
+        # GOOS/GOARCH. Including github.sha makes each run save a fresh entry; the
+        # restore-keys fall back to the most recent build cache for this target so
+        # only changed packages recompile.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}-
+            gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-
+
+      - name: Download web UI assets
+        # Restores pkg/webui/dist (built once by the webui job) so the
+        # //go:embed in pkg/webui embeds the real SPA into this binary. Without
+        # it, `go build` would embed the "run make web" placeholder.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: webui-dist
+          path: pkg/webui/dist
+
+      - name: Build binary
+        # Same flags as the Dockerfile build stage (CGO off + netgo/osusergo =>
+        # a self-contained binary that cross-compiles without QEMU for every
+        # OS/arch), plus the version stamp so the published binary's
+        # `cornus version` matches the tag.
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          out="cornus-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -tags "netgo osusergo" \
+            -ldflags "-s -w -X main.version=${version}" \
+            -o "${out}" ./cmd/cornus
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cornus-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          path: cornus-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # Keyless cosign signing of the SHA256SUMS manifest (GitHub OIDC).
+      id-token: write
+    steps:
+      - name: Download built binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        # One manifest covering every released binary. Filenames are recorded
+        # relative to dist/ so `sha256sum -c SHA256SUMS` works next to the
+        # downloaded binaries.
+        run: |
+          cd dist
+          sha256sum cornus-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign SHA256SUMS (keyless)
+        # Keyless signature over the checksum manifest as a single Sigstore
+        # bundle (SHA256SUMS.bundle) carrying the signature, the short-lived
+        # Fulcio certificate, and the Rekor inclusion proof. cosign v3 defaults
+        # sign-blob to this new bundle format and ignores the old
+        # --output-signature/--output-certificate flags, so we emit the bundle
+        # directly. Verify with
+        #   cosign verify-blob --bundle SHA256SUMS.bundle \
+        #     --certificate-identity-regexp 'github.com/.+/.github/workflows/release.yml' \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     SHA256SUMS
+        run: |
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.bundle \
+            dist/SHA256SUMS
+
+      - name: Create release and attach binaries
+        # Attaches every built artifact: cornus-{linux,darwin}-{amd64,arm64} and
+        # cornus-windows-{amd64,arm64}.exe, plus the SHA256SUMS manifest and
+        # its keyless cosign bundle. The README's quick start fetches
+        #   releases/latest/download/cornus-linux-<arch>
+        # so those Linux filenames must stay exactly cornus-linux-amd64/arm64.
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          files: |
+            dist/cornus-*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
+          fail_on_unmatched_files: true
+          generate_release_notes: true

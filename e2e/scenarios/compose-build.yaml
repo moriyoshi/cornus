@@ -1,0 +1,8 @@
+# A service built from a Dockerfile (not a public image) so the compose `build`
+# path is exercised: `cornus compose` builds + pushes the image, then deploys it.
+name: cbld
+services:
+  app:
+    build:
+      context: ./app-build
+    command: ["sh", "-c", "sleep infinity"]

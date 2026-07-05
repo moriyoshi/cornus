@@ -1,0 +1,108 @@
+name: E2E
+
+# Executes the full Starlark E2E harness inside the all-in-one containerized
+# runner (Docker-in-Docker + the in-process build engine + kind/kubectl). This is
+# the execution counterpart to the lightweight `e2e-check` syntax gate in ci.yml:
+# ci.yml parses+resolves every scenario on each PR, this workflow actually runs
+# them.
+#
+# It is heavy and must run privileged, so it is scoped to merges into main and
+# manual dispatch rather than every PR. See TESTING.md "Containerized runner".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One E2E run per ref; a newer push supersedes an in-flight one.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    # The kube target pre-creates a kind cluster inside the DinD image and runs
+    # the full suite through it; give every target generous headroom.
+    timeout-minutes: 60
+    strategy:
+      # Report each target independently — a kube flake must not mask a real
+      # docker regression (or vice versa). The containerd leg runs the
+      # backend-agnostic scenario subset against the image's in-container
+      # standalone containerd (the entrypoint's CONTAINERD_SCENARIOS default).
+      fail-fast: false
+      matrix:
+        target: [docker, kube, containerd]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the all-in-one E2E runner image
+        # Build the same image as `make e2e-image`, but through buildx with a
+        # cross-run GitHub Actions layer cache so the golang deps + staged tools
+        # (kind/kubectl/crane/multus) are not refetched every run. load: true
+        # drops the result into the local docker so the run step can start it.
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: e2e/container/Dockerfile
+          tags: cornus-e2e:ci
+          load: true
+          # The kube leg additionally embeds the OpenTelemetry Collector (the
+          # `otelcol` tag) so the caretaker sidecar can run the otel-collector
+          # scenario; the other legs stay lean (the scenario is kube-only). Per-arg
+          # buildkit cache keeps both variants under one scope.
+          build-args: |
+            BUILD_TAGS=${{ matrix.target == 'kube' && 'netgo osusergo otelcol' || 'netgo osusergo' }}
+          cache-from: type=gha,scope=e2e-image
+          cache-to: type=gha,mode=max,scope=e2e-image
+
+      - name: Load 9p kernel modules on the runner host
+        # The E2E runner container runs --privileged and shares the host kernel,
+        # so the 9p filesystem support that the kube mount sidecar and the
+        # lazy_9p build scenario need must be loaded on the runner itself: the
+        # module objects live under the host's /lib/modules, not in the container
+        # image, and preflight (probe9P) only sees 9p once it is in
+        # /proc/filesystems. GitHub-hosted ubuntu runners ship these modules but
+        # do not preload them. trans=unix only needs 9p + 9pnet (fd transport is
+        # built into 9pnet); 9pnet_virtio is loaded best-effort for completeness.
+        run: |
+          sudo modprobe 9p 9pnet
+          sudo modprobe 9pnet_virtio || true
+          lsmod | grep 9p || true
+          if ! grep -qw 9p /proc/filesystems; then
+            echo "::error::9p not in /proc/filesystems after modprobe — runner kernel lacks the 9p module" >&2
+            exit 1
+          fi
+          echo "9p filesystem available on the runner host"
+
+      - name: Run the E2E suite (${{ matrix.target }})
+        # The entrypoint starts dockerd, runs preflight, and for the kube target
+        # spins up (and tears down) the in-container kind cluster. It must be
+        # privileged: the build engine mounts overlayfs / creates namespaces and
+        # kind needs it too. A non-zero exit fails the job.
+        #
+        # E2E_MULTUS=1 on the kube leg makes the entrypoint install the Multus
+        # DaemonSet staged in the runner image into the kind cluster, so the
+        # deploy-multus scenario actually runs instead of self-skipping. The
+        # docker and containerd legs keep it off (Multus is kube-only).
+        #
+        # E2E_KNATIVE=1 on the kube leg likewise makes the entrypoint install
+        # Knative Serving + Kourier (from upstream manifests — the runner has
+        # internet, and the kind nodes already pull external images such as the
+        # alpine deploy-ingress uses) so the deploy-knative scenario round-trips a
+        # real ksvc instead of self-skipping. kube-only, like Multus.
+        run: |
+          docker run --rm --privileged \
+            -e E2E_TARGETS="${{ matrix.target }}" \
+            -e E2E_MULTUS="${{ matrix.target == 'kube' && '1' || '0' }}" \
+            -e E2E_KNATIVE="${{ matrix.target == 'kube' && '1' || '0' }}" \
+            -e CORNUS_TEST_OTEL="${{ matrix.target == 'kube' && '1' || '' }}" \
+            cornus-e2e:ci

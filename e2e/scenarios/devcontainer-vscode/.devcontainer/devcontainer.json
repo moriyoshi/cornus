@@ -1,0 +1,23 @@
+{
+    // Fixture for the REAL VS Code devcontainer toolchain (@devcontainers/cli)
+    // driven against the cornus Docker API proxy — see devcontainer-vscode.star.
+    // The scenario copies this directory into a temp workspace before `up`, so
+    // postCreateCommand writes never touch the committed tree.
+    //
+    // Image-based and entrypoint-less on purpose: alpine:3.20 is what
+    // dockerd.star already pulls (shared cache), and with overrideCommand the
+    // CLI supplies Entrypoint=["/bin/sh"] + a keepalive Cmd — exercising the
+    // proxy's create-time Entrypoint translation.
+    "name": "cornus-devcontainer-vscode-e2e",
+    "image": "alpine:3.20",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/app,type=bind",
+    "workspaceFolder": "/workspaces/app",
+    "overrideCommand": true,
+    "userEnvProbe": "none",
+    "containerEnv": {
+        "CORNUS_E2E_MARKER": "vscode-dc"
+    },
+    // Writes into the workspace: proves both the lifecycle-hook exec path and
+    // container->host visibility of the bind mount in one step.
+    "postCreateCommand": "echo POSTCREATE_OK > /workspaces/app/postcreate.txt"
+}

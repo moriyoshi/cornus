@@ -1,0 +1,19 @@
+{{- $svcType := .Values.service.type }}
+{{- if not $svcType }}{{ $svcType = ternary "NodePort" "ClusterIP" (eq .Values.registry.exposure "nodePort") }}{{ end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cornus.fullname" . }}
+  labels:
+    {{- include "cornus.labels" . | nindent 4 }}
+spec:
+  type: {{ $svcType }}
+  selector:
+    {{- include "cornus.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: 5000
+      {{- if and (eq $svcType "NodePort") .Values.registry.nodePort }}
+      nodePort: {{ .Values.registry.nodePort }}
+      {{- end }}
