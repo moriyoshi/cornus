@@ -22,6 +22,15 @@ type LinkProfile struct {
 	Latency     time.Duration // one-way propagation delay
 }
 
+// NewLink returns two endpoints of a duplex link with the given per-direction
+// bandwidth and latency. Close either end to tear the link down.
+//
+// Exported so harnesses outside this package can drive a protocol over the same
+// emulated conditions — the mount-mode A/B in pkg/wire compares raw 9P against
+// the block protocol over these profiles, where a difference in round-trip COUNT
+// (invisible on a local socket) dominates.
+func NewLink(p LinkProfile) (net.Conn, net.Conn) { return newLink(p) }
+
 // newLink returns two endpoints of a duplex link with the given per-direction
 // bandwidth and latency. Close either end to tear the link down.
 func newLink(p LinkProfile) (net.Conn, net.Conn) {

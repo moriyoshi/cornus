@@ -406,7 +406,7 @@ func DialConnControlHeaderCT(ctx context.Context, url string, control func(netwo
 // session over it — the secured hub/caretaker dial.
 func DialTLS(ctx context.Context, url string, tc *tls.Config) (*yamux.Session, error) {
 	opts := &websocket.DialOptions{HTTPClient: &http.Client{Transport: &http.Transport{TLSClientConfig: tc}}}
-	c, _, err := websocket.Dial(ctx, url, opts)
+	c, _, err := websocket.Dial(ctx, url, withWriteBuffer(opts))
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial %s: %w", url, err)
 	}
@@ -470,7 +470,7 @@ func dialConn(ctx context.Context, url string, control func(network, address str
 			opts.HTTPHeader = header
 		}
 	}
-	c, _, err := websocket.Dial(ctx, url, opts)
+	c, _, err := websocket.Dial(ctx, url, withWriteBuffer(opts))
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial %s: %w", url, err)
 	}

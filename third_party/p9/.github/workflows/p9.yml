@@ -1,0 +1,162 @@
+name: p9
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Cancel running workflows on new push to a PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    strategy:
+      matrix:
+        goos: ['linux', 'windows', 'openbsd', 'freebsd', 'netbsd']
+        goarch: ['386', 'amd64', 'arm', 'arm64']
+        include:
+          - goos: 'darwin'
+            goarch: 'arm64'
+          - goos: 'solaris'
+            goarch: 'amd64'
+          - goos: 'linux'
+            goarch: 'mips'
+          - goos: 'linux'
+            goarch: 'mips64'
+          - goos: 'linux'
+            goarch: 'mipsle'
+          - goos: 'linux'
+            goarch: 'mips64le'
+          - goos: 'linux'
+            goarch: 'ppc64'
+          - goos: 'linux'
+            goarch: 'ppc64le'
+          - goos: 'linux'
+            goarch: 'riscv64'
+        exclude:
+          - goos: 'netbsd'
+            goarch: 'arm64'
+
+    runs-on: ubuntu-latest
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+      - name: Build
+        run: go build -v ./...
+
+  test:
+    name: Unit test
+    strategy:
+      matrix:
+        go-version: ['1.21.x']
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: go test -v -covermode atomic -coverpkg ./... -coverprofile cover.out ./...
+
+      - name: Archive coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.platform }}
+          path: cover.out
+
+      - name: Race
+        run: go test -race -timeout 15m -v ./...
+
+      - uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: '19f1ec66-d755-4010-bc76-0c8091d231c3'
+        with:
+          flags: ${{ matrix.platform }}-unit
+          fail_ci_if_error: true
+          verbose: true
+
+  fuzz:
+    name: Fuzz
+    runs-on: [ubuntu-latest]
+    steps:
+      - name: Build Fuzzers
+        id: build
+        uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
+        with:
+          oss-fuzz-project-name: 'p9'
+          dry-run: false
+
+      - name: Run Fuzzers
+        uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
+        with:
+          oss-fuzz-project-name: 'p9'
+          fuzz-seconds: 600
+          dry-run: false
+
+      - name: Upload Crash
+        uses: actions/upload-artifact@v4
+        if: failure() && steps.build.outcome == 'success'
+        with:
+          name: artifacts
+          path: ./out/artifacts
+
+  vmtest:
+    name: VM tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ '1.21.x' ]
+        vmarch: [ 'amd64', 'arm', 'arm64' ]
+        include:
+          # QEMU's -M virt only supports GOARM=5, so add goarm=5 only for
+          # arm configs
+          - vmarch: arm
+            goarm: '5'
+
+    env:
+      GO_VERSION: ${{ matrix.go-version }}
+      VMTEST_ARCH: ${{ matrix.vmarch }}
+      GOARM: ${{ matrix.goarm }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build runvm tool
+        run: go install github.com/hugelgupf/vmtest/tools/runvmtest@latest
+
+      - name: Test
+        run: |
+          mkdir gocov
+          GOCOVERDIR=$(pwd)/gocov \
+            VMTEST_GO_PROFILE=vmcoverage.txt runvmtest -- \
+            go test -v -coverpkg=./... -covermode=atomic \
+            -coverprofile=coverage.txt ./...
+
+      - uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: '19f1ec66-d755-4010-bc76-0c8091d231c3'
+        with:
+          flags: ubuntu-vm-${{ matrix.vmarch }}
+          fail_ci_if_error: true
+          verbose: true
+          env_vars: GO_VERSION,VMTEST_ARCH

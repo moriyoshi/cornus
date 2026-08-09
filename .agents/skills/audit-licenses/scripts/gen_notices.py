@@ -87,10 +87,18 @@ def main():
     if vend:
         lines += ["## Vendored components (under `third_party/`)", ""]
         for v in vend:
+            # Keyed on whether the copy IS modified, not on its license. Keying
+            # it on the category meant only MPL copies were ever annotated, so an
+            # Apache-2.0 or ISC fork would have been listed as a pristine copy —
+            # which is precisely what Apache section 4(b) requires be stated.
             note = ""
-            if v["category"] == "weak-copyleft":
-                note = (" — **modified copy**; source is provided in-tree under "
-                        "the same license as required")
+            if v.get("modified"):
+                if v["category"] == "weak-copyleft":
+                    note = (" — **modified copy**; source is provided in-tree under "
+                            "the same license as required")
+                else:
+                    note = (" — **modified copy**; the changes are described in its "
+                            "README and marked in the files they touch")
             # An origin is not always resolvable (no go.mod, no README provenance
             # row); say nothing rather than attribute the copy to a literal "None".
             where = f"origin `{v['origin']}`, " if v.get("origin") else ""

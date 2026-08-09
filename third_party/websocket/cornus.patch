@@ -1,0 +1,72 @@
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/dial.go fork/dial.go
+--- upstream/dial.go
++++ fork/dial.go
+@@ -1,3 +1,7 @@
++// Modified by the Cornus project, 2026: adds DialOptions.WriteBufferSize and
++// threads it into getBufioWriter, so a client's masked writes are not flushed in
++// fixed 4 KiB chunks. See third_party/websocket/README.md.
++
+ //go:build !js
+ 
+ package websocket
+@@ -55,6 +59,22 @@
+ 	// To avoid blocking, any expensive processing should be performed asynchronously using a goroutine.
+ 	OnPingReceived func(ctx context.Context, payload []byte) bool
+ 
++	// WriteBufferSize is the size in bytes of the buffer used to batch and mask
++	// outgoing frame payloads. Zero uses the default (4096).
++	//
++	// It matters for CLIENT connections carrying large messages. Client writes
++	// must be masked, and writeFramePayload masks and flushes in chunks bounded by
++	// this buffer, so a client sending N bytes issues ceil(N/WriteBufferSize)
++	// write syscalls no matter how the bytes are framed. Server writes are
++	// unmasked and take bufio's large-write bypass, so this has little effect on
++	// them.
++	//
++	// The bytes on the wire are identical at any size: writeFramePayload threads
++	// the rotated mask key across chunks.
++	//
++	// Cornus fork addition. See third_party/websocket/README.md.
++	WriteBufferSize int
++
+ 	// OnPongReceived is an optional callback invoked synchronously when a pong frame is received.
+ 	//
+ 	// The payload contains the application data of the pong frame.
+@@ -181,7 +201,7 @@
+ 		onPingReceived: opts.OnPingReceived,
+ 		onPongReceived: opts.OnPongReceived,
+ 		br:             getBufioReader(rwc),
+-		bw:             getBufioWriter(rwc),
++		bw:             getBufioWriter(rwc, opts.WriteBufferSize),
+ 	}), resp, nil
+ }
+ 
+@@ -333,7 +353,16 @@
+ 
+ var bufioWriterPool sync.Pool
+ 
+-func getBufioWriter(w io.Writer) *bufio.Writer {
++// defaultWriteBufferSize is bufio's own default, and the only size the shared
++// pool below may hold.
++const defaultWriteBufferSize = 4096
++
++func getBufioWriter(w io.Writer, size int) *bufio.Writer {
++	if size > 0 && size != defaultWriteBufferSize {
++		// The pool is not size-segregated, so a custom size must bypass it —
++		// otherwise the next connection inherits a mis-sized buffer.
++		return bufio.NewWriterSize(w, size)
++	}
+ 	bw, ok := bufioWriterPool.Get().(*bufio.Writer)
+ 	if !ok {
+ 		return bufio.NewWriter(w)
+@@ -343,5 +372,9 @@
+ }
+ 
+ func putBufioWriter(bw *bufio.Writer) {
++	if bw.Size() != defaultWriteBufferSize {
++		// Custom-sized: never came from the pool, must not enter it.
++		return
++	}
+ 	bufioWriterPool.Put(bw)
+ }
+Only in fork: writebuffersize_test.go

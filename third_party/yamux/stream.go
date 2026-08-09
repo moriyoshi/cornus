@@ -159,6 +159,23 @@ START:
 	case streamClosed:
 		s.recvLock.Lock()
 		if s.recvBuf == nil || s.recvBuf.Len() == 0 {
+			// Cornus fork: this is the one point where releasing the receive buffer is
+			// provably safe — the peer will send no more and the reader has drained
+			// everything, which is exactly what returning EOF asserts. Recycling it
+			// here lets the next stream start from a grown buffer instead of climbing
+			// the doubling ladder again.
+			//
+			// It was first hooked into Session.closeStream, which is wrong twice over:
+			// that runs from the receive loop with stateLock held (processFlags defers
+			// LIFO, so its "close without holding the state lock" comment does not
+			// hold), which closes an ABBA cycle against a reader in sendWindowUpdate;
+			// and the stream's lifecycle there does not establish that no further data
+			// is coming. It cost an intermittent data loss in TestHalfCloseSessionShutdown
+			// before it was moved here.
+			if s.recvBuf != nil {
+				putRecvBuf(s.recvBuf)
+				s.recvBuf = nil
+			}
 			s.recvLock.Unlock()
 			s.stateLock.Unlock()
 			return 0, io.EOF
@@ -587,7 +604,9 @@ func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 	if s.recvBuf == nil {
 		// Allocate the receive buffer just-in-time to fit the full data frame.
 		// This way we can read in the whole packet without further allocations.
-		s.recvBuf = bytes.NewBuffer(make([]byte, 0, length))
+		// Cornus fork: from a size-classed pool, so a buffer that a previous stream
+		// already grew is reused rather than climbing the doubling ladder again.
+		s.recvBuf = getRecvBuf(int(length))
 	}
 	copiedLength, err := io.Copy(s.recvBuf, conn)
 	if err != nil {
@@ -636,6 +655,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 func (s *Stream) Shrink() {
 	s.recvLock.Lock()
 	if s.recvBuf != nil && s.recvBuf.Len() == 0 {
+		putRecvBuf(s.recvBuf) // cornus fork: recycle rather than drop
 		s.recvBuf = nil
 	}
 	s.recvLock.Unlock()

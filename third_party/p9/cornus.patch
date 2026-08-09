@@ -1,0 +1,289 @@
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/p9/file.go fork/p9/file.go
+--- upstream/p9/file.go
++++ fork/p9/file.go
+@@ -12,6 +12,10 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// Modified by the Cornus project, 2026: documents that File.WriteAt must not
++// retain p, which is the contract the server's payload reuse depends on.
++// See third_party/p9/README.md.
++
+ package p9
+ 
+ import (
+@@ -121,6 +125,11 @@
+ 
+ 	// WriteAt writes to this file. Open must be called first.
+ 	//
++	// Implementations must not retain p: on the server it may be a buffer the
++	// connection reuses for the next request as soon as WriteAt returns. This is
++	// the same contract io.WriterAt states, and it is what lets the server serve
++	// Twrite payloads from a pool instead of allocating one per write.
++	//
+ 	// This may return io.EOF in addition to linux.Errno values.
+ 	//
+ 	// On the server, WriteAt has a read concurrency guarantee. See Open
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/p9/handlers.go fork/p9/handlers.go
+--- upstream/p9/handlers.go
++++ fork/p9/handlers.go
+@@ -711,7 +711,7 @@
+ 	}
+ 
+ 	var n int
+-	data := cs.readBufPool.Get().(*[]byte)
++	data := cs.getReadBuf()
+ 	// Retain a reference to the full length of the buffer.
+ 	dataBuf := (*data)
+ 	if err := ref.safelyRead(func() (err error) {
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/p9/messages.go fork/p9/messages.go
+--- upstream/p9/messages.go
++++ fork/p9/messages.go
+@@ -12,6 +12,11 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// Modified by the Cornus project, 2026: adds the payloadAllocator interface and
++// twrite's pooled-payload lifecycle; registry.put routes payload-owning messages
++// through it.
++// See third_party/p9/README.md.
++
+ package p9
+ 
+ import (
+@@ -57,6 +62,28 @@
+ 	PayloadCleanup()
+ }
+ 
++// payloadAllocator is implemented by messages whose inline payload buffer is
++// owned by p9 ITSELF rather than supplied by a caller, so recv may hand them a
++// pooled buffer instead of allocating one per message.
++//
++// Only *twrite qualifies, and the restriction is load-bearing rather than
++// conservative: it is the one payloader that is both DECODED on the receive path
++// and obtained from msgDotLRegistry. The response payloaders (rread, rreaddir)
++// are decoded into a CALLER's buffer on the client side — clientFile.readAt sets
++// rread.Data to the caller's slice — so resizing or reusing those would let a
++// server writing more than was asked for scribble past the caller's region.
++//
++// Cornus fork addition. See third_party/p9/README.md.
++type payloadAllocator interface {
++	// allocPayload returns a buffer of exactly n bytes to decode into.
++	allocPayload(n int) []byte
++
++	// releasePayload returns any borrowed buffer and drops all references to it,
++	// including the connection it came from. Called before the message re-enters
++	// the (process-global) registry cache.
++	releasePayload()
++}
++
+ // tversion is a version request.
+ type tversion struct {
+ 	// MSize is the message size to use.
+@@ -1073,7 +1100,7 @@
+ func (r *rreadServerPayloader) PayloadCleanup() {
+ 	// Fill it with zeros to not risk leaking previous files' data.
+ 	copy(r.Data, r.cs.pristineZeros)
+-	r.cs.readBufPool.Put(&r.fullBuffer)
++	r.cs.putReadBuf(&r.fullBuffer)
+ }
+ 
+ // String implements fmt.Stringer.
+@@ -1091,6 +1118,13 @@
+ 
+ 	// Data is the data to be written.
+ 	Data []byte
++
++	// cs and payloadBuf implement payloadAllocator (cornus fork): cs is the
++	// connection this message was received on, set by connState.lookup, and
++	// payloadBuf the pooled buffer Data is a bounded view of. Both are cleared by
++	// releasePayload before the message returns to the shared registry.
++	cs         *connState
++	payloadBuf []byte
+ }
+ 
+ // decode implements encoder.decode.
+@@ -1129,6 +1163,39 @@
+ 
+ func (t *twrite) PayloadCleanup() {}
+ 
++// allocPayload implements payloadAllocator.allocPayload (cornus fork).
++//
++// The buffer comes from the RECEIVING CONNECTION's pool — the same one tread has
++// borrowed from since rreadServerPayloader was introduced — so no buffer is ever
++// shared between connections and the process-global registry cache is not
++// involved. Falls back to a fresh allocation before version negotiation (no pool
++// yet) and for a payload larger than the negotiated msize.
++func (t *twrite) allocPayload(n int) []byte {
++	if t.cs == nil || t.cs.pristineZeros == nil || n > len(t.cs.pristineZeros) {
++		return make([]byte, n)
++	}
++	if t.payloadBuf == nil {
++		t.payloadBuf = *(t.cs.getReadBuf())
++	}
++	// Three-index slice: len == cap == n, so a File implementation cannot reslice
++	// or append its way into bytes an earlier request left behind. recv fills
++	// [0,n) completely (vecnet.Buffers.ReadFrom reads until every buf is full)
++	// before decode or any handler runs, so every byte a handler can observe came
++	// from this request's wire bytes.
++	return t.payloadBuf[:n:n]
++}
++
++// releasePayload implements payloadAllocator.releasePayload (cornus fork).
++func (t *twrite) releasePayload() {
++	if t.payloadBuf != nil && t.cs != nil {
++		b := t.payloadBuf
++		t.cs.putReadBuf(&b)
++	}
++	t.payloadBuf = nil
++	t.cs = nil
++	t.Data = nil
++}
++
+ // SetPayload implements payloader.SetPayload.
+ func (t *twrite) SetPayload(p []byte) {
+ 	t.Data = p
+@@ -2239,7 +2306,14 @@
+ }
+ 
+ func (r *registry) put(msg message) {
+-	if p, ok := msg.(payloader); ok {
++	// Cornus fork: a message that owns its payload buffer returns it to the
++	// connection it came from and drops every reference, including that
++	// connection — the cache below is process-global and shared across
++	// connections, so nothing connection-scoped may survive into it. Everything
++	// else keeps upstream's blanket nil-out.
++	if p, ok := msg.(payloadAllocator); ok {
++		p.releasePayload()
++	} else if p, ok := msg.(payloader); ok {
+ 		p.SetPayload(nil)
+ 	}
+ 
+Only in fork/p9: race_off_test.go
+Only in fork/p9: race_on_test.go
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/p9/server.go fork/p9/server.go
+--- upstream/p9/server.go
++++ fork/p9/server.go
+@@ -12,6 +12,10 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// Modified by the Cornus project, 2026: adds connState.lookup, which binds a
++// received Twrite to the connection whose buffer pool serves its payload.
++// See third_party/p9/README.md.
++
+ package p9
+ 
+ import (
+@@ -94,8 +98,10 @@
+ 
+ 	// messageSize is the maximum message size. The server does not
+ 	// do automatic splitting of messages.
+-	messageSize   uint32
+-	readBufPool   sync.Pool
++	messageSize uint32
++	readBufPool sync.Pool
++	// readBufHot is a GC-proof cache in FRONT of readBufPool; see getReadBuf.
++	readBufHot    atomic.Pointer[[]byte]
+ 	pristineZeros []byte
+ 
+ 	// baseVersion is the version of 9P protocol.
+@@ -469,6 +475,53 @@
+ //
+ // The recvDone channel is signaled when recv is done (with a error if
+ // necessary). The sendDone channel is signaled with the result of the send.
++// getReadBuf and putReadBuf borrow an msize-shaped buffer for this connection,
++// through a one-slot GC-proof cache in front of readBufPool.
++//
++// Cornus fork addition, and the reason it exists is measured rather than
++// theoretical. A sync.Pool is emptied completely by every collection, and on a
++// bulk 9P path the pool's OWN misses are what drive the next collection: a miss
++// allocates a whole msize buffer, that allocation brings the collector round, and
++// the collector empties the pool again before the next request. Profiling a
++// sequential write showed this pool's New accounting for a THIRD of all bytes
++// allocated on the path, with only one request in flight at a time — so it was
++// not contention, it was the pool never surviving to be reused.
++//
++// One slot, not a pool of them, and not the concurrency bound: the steady state
++// of sequential I/O is one buffer in flight, a slot costs msize of permanently
++// pinned memory per connection (the same order as pristineZeros, which this
++// connection already holds), and anything beyond that is better left to the
++// sync.Pool below, which returns idle memory. Bursts fall through to it and are
++// unaffected.
++func (cs *connState) getReadBuf() *[]byte {
++	if bp := cs.readBufHot.Swap(nil); bp != nil {
++		return bp
++	}
++	return cs.readBufPool.Get().(*[]byte)
++}
++
++func (cs *connState) putReadBuf(bp *[]byte) {
++	if cs.readBufHot.CompareAndSwap(nil, bp) {
++		return
++	}
++	cs.readBufPool.Put(bp)
++}
++
++// lookup is msgDotLRegistry.get with the received message bound to THIS
++// connection, so a Twrite's payload can be served from this connection's buffer
++// pool rather than a fresh per-message allocation. Cornus fork addition; see
++// twrite.allocPayload and third_party/p9/README.md.
++func (cs *connState) lookup(t tag, mt msgType) (message, error) {
++	m, err := msgDotLRegistry.get(t, mt)
++	if err != nil {
++		return m, err
++	}
++	if w, ok := m.(*twrite); ok {
++		w.cs = cs
++	}
++	return m, nil
++}
++
+ func (cs *connState) handleRequest() bool {
+ 	cs.pendingWg.Add(1)
+ 	defer cs.pendingWg.Done()
+@@ -492,7 +545,7 @@
+ 	}
+ 
+ 	// Receive a message.
+-	tag, m, err := recv(cs.server.log, cs.t, messageSize, msgDotLRegistry.get)
++	tag, m, err := recv(cs.server.log, cs.t, messageSize, cs.lookup)
+ 	if errSocket, ok := err.(ConnError); ok {
+ 		if errSocket.error != io.EOF {
+ 			// Connection problem; stop serving.
+diff -ru '--exclude=cornus.patch' '--exclude=regen-patch.sh' '--exclude=README.md' '--exclude=README.upstream.md' upstream/p9/transport.go fork/p9/transport.go
+--- upstream/p9/transport.go
++++ fork/p9/transport.go
+@@ -12,6 +12,11 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// Modified by the Cornus project, 2026: recv serves a payload-owning message's
++// buffer from the receiving connection's pool instead of allocating one per
++// message.
++// See third_party/p9/README.md.
++
+ package p9
+ 
+ import (
+@@ -212,8 +217,18 @@
+ 		}
+ 
+ 		// Include the payload.
++		//
++		// Cornus fork: a message that OWNS its payload buffer (only *twrite; see
++		// payloadAllocator) is given one from the receiving connection's pool
++		// instead of a fresh allocation per message, which is otherwise about one
++		// payload-sized allocation per write. The else-if arm below is upstream
++		// verbatim, so the client path — where Payload() is the CALLER's buffer and
++		// must never be resized or reused — is untouched.
+ 		p := payloader.Payload()
+-		if p == nil || len(p) != int(remaining-fixedSize) {
++		if a, ok := m.(payloadAllocator); ok {
++			p = a.allocPayload(int(remaining - fixedSize))
++			payloader.SetPayload(p)
++		} else if p == nil || len(p) != int(remaining-fixedSize) {
+ 			p = make([]byte, remaining-fixedSize)
+ 			payloader.SetPayload(p)
+ 		}
+Only in fork/p9: twrite_payload_test.go

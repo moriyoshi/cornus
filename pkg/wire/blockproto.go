@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -95,6 +96,23 @@ const (
 	// at fsync, reconciling the proxy cache in a batch. Composes with
 	// FeatSubBlockHash (the dirty unit is then a sub-block, else a whole block).
 	FeatDeferHash uint32 = 1 << 1
+	// FeatNoCache tells the CALLER that the proxy retains nothing (ServeBlockProxy
+	// with a nil cache), so there is no cache to keep coherent and every write can
+	// skip its authoritative hash. That matters because the classic hash covers a
+	// whole 1 MiB block: the kernel writes at msize granularity, which is NOT a
+	// multiple of the block, so all but the first write straddles a boundary and
+	// the caller reads a whole block back off disk to hash bytes the proxy then
+	// discards. It also makes a write-only fd work — hashing a straddling write
+	// needs a read-back, which fails EBADF on a file opened O_WRONLY.
+	//
+	// Unlike the coherence bits it is a CAPABILITY, not a preference: the caller
+	// advertises it unconditionally and the proxy advertises it only when it truly
+	// holds no cache, so the intersection is exactly "the proxy asked for it and
+	// this caller understands it". It is deliberately NOT in
+	// blockSupportedFeatures and not parseable from the environment — an operator
+	// who could set it on a CACHED mount would silently stop that cache being
+	// validated.
+	FeatNoCache uint32 = 1 << 3
 	// FeatSubBlockFill is demand-fill reads: a read miss fetches only the touched
 	// sub-block range (aligned to subBlockSize) instead of the whole 1 MiB block,
 	// and the cache tracks presence per sub-block. This cuts read amplification for
@@ -104,8 +122,10 @@ const (
 	// coherence, so it implies FeatSubBlockHash (see resolveBlockOpts).
 	FeatSubBlockFill uint32 = 1 << 2
 
-	// blockSupportedFeatures is what this build advertises; the negotiated set is
+	// blockSupportedFeatures is the set an OPTION may request; the negotiated set is
 	// intersected with the requested features (WithBlockFeatures) and the peer's.
+	// FeatNoCache is absent on purpose — it is derived from whether the proxy has a
+	// cache, never requested (see FeatNoCache).
 	blockSupportedFeatures = FeatSubBlockHash | FeatDeferHash | FeatSubBlockFill
 )
 
@@ -248,42 +268,117 @@ type frame struct {
 // writeFrame writes f. The caller MUST hold the connection's send lock so the
 // header and payload are not interleaved with another frame.
 func writeFrame(w io.Writer, f frame) error {
+	return writeFrameParts(w, f, nil)
+}
+
+// smallFrameBufs pools the little header+meta staging buffers writeFrameParts
+// assembles, so the framing layer allocates nothing per frame.
+var smallFrameBufs = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
+// writeFrameParts writes one frame whose payload is f.payload followed by bulk.
+// The caller MUST hold the connection's send lock.
+//
+// Splitting the payload matters for the data ops. A 1 MiB write used to be
+// appended into a msgW — allocating and copying a megabyte per request purely to
+// place 20 bytes of header in front of it — and the same on the reply side for
+// reads. Here the header and the small metadata go out in ONE buffer and the bulk
+// is written straight from the caller's slice, so the wire format is unchanged
+// and the copy is gone.
+//
+// Frames without bulk also gain: header and payload leave in a single Write,
+// where before every frame cost two (and, on a muxed transport, two frames).
+func writeFrameParts(w io.Writer, f frame, bulk []byte) error {
+	bp := smallFrameBufs.Get().(*[]byte)
+	buf := (*bp)[:0]
+	defer func() { *bp = buf[:0]; smallFrameBufs.Put(bp) }()
+
+	total := blockFrameHeader + len(f.payload) + len(bulk)
 	var hdr [4 + blockFrameHeader]byte
-	total := blockFrameHeader + len(f.payload)
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(total))
 	hdr[4] = f.op
 	hdr[5] = f.flags
 	// hdr[6:8] reserved = 0
 	binary.BigEndian.PutUint64(hdr[8:16], f.reqID)
-	if _, err := w.Write(hdr[:]); err != nil {
+	buf = blitAppend(blitFrameStage, buf, hdr[:])
+	buf = blitAppend(blitFrameStage, buf, f.payload)
+	// A frame small enough to stage whole goes out in one Write; a bulk one keeps
+	// its data uncopied and pays a second Write for it.
+	if len(bulk) > 0 && len(bulk) <= smallBulkInline {
+		buf = blitAppend(blitFrameStage, buf, bulk)
+		bulk = nil
+	}
+	if _, err := w.Write(buf); err != nil {
 		return err
 	}
-	if len(f.payload) > 0 {
-		if _, err := w.Write(f.payload); err != nil {
+	if len(bulk) > 0 {
+		if _, err := w.Write(bulk); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// readFrame reads one frame, rejecting a payload larger than maxPayload.
-func readFrame(r io.Reader, maxPayload int) (frame, error) {
+// smallBulkInline is the bulk size below which staging a copy beats a second
+// Write (a second write syscall, and a second frame on a muxed transport).
+const smallBulkInline = 2048
+
+// blockReadBuf is the receive buffer each endpoint puts in front of its
+// connection. Every frame arrival used to cost two reads — a 16-byte header, then
+// the payload — and three on the direct-delivery read path. Buffered, the header
+// and a small payload come out of one fill.
+//
+// The size is a copy budget, not a round number. It must exceed the largest
+// NON-bulk frame so that shape lands in one fill: the largest is a page-sized
+// write, 4096 bytes of body plus header and metadata, which is a little over
+// 4 KiB — so 4096 would just miss it, on the shape that matters most. And it must
+// stay small relative to a bulk frame, because bufio only bypasses its buffer for
+// a large read when the buffer is EMPTY: the extra bytes copied are bounded by
+// one buffer per frame, ~0.8% of a 1 MiB frame here, against 100% if this ever
+// reached the frame size and the bypass stopped firing altogether.
+const blockReadBuf = 8192
+
+// frameHeader is one decoded frame header; plen is the payload length still to be
+// read off the connection.
+type frameHeader struct {
+	op    byte
+	flags byte
+	reqID uint64
+	plen  int
+}
+
+// readFrameHeader reads a frame's fixed header, rejecting a payload larger than
+// maxPayload. The payload itself is left on the connection so the reader can
+// choose where it lands — see blockClient.readLoop, which reads a read reply's
+// bulk STRAIGHT INTO the requester's buffer.
+func readFrameHeader(r io.Reader, maxPayload int) (frameHeader, error) {
 	var hdr [4 + blockFrameHeader]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return frame{}, err
+	// Counted like the header the send side stages, so the two directions stay
+	// symmetric — an instrument that tallies a header going out but not coming in
+	// invites exactly the wrong conclusion about which side is cheaper.
+	if _, err := blitReadFull(blitWireRead, r, hdr[:]); err != nil {
+		return frameHeader{}, err
 	}
 	total := int(binary.BigEndian.Uint32(hdr[0:4]))
 	if total < blockFrameHeader {
-		return frame{}, errors.New("blockproto: short frame")
+		return frameHeader{}, errors.New("blockproto: short frame")
 	}
 	plen := total - blockFrameHeader
 	if plen > maxPayload {
-		return frame{}, errors.New("blockproto: frame too large")
+		return frameHeader{}, errors.New("blockproto: frame too large")
 	}
-	f := frame{op: hdr[4], flags: hdr[5], reqID: binary.BigEndian.Uint64(hdr[8:16])}
-	if plen > 0 {
-		f.payload = make([]byte, plen)
-		if _, err := io.ReadFull(r, f.payload); err != nil {
+	return frameHeader{op: hdr[4], flags: hdr[5], reqID: binary.BigEndian.Uint64(hdr[8:16]), plen: plen}, nil
+}
+
+// readFrame reads one frame, rejecting a payload larger than maxPayload.
+func readFrame(r io.Reader, maxPayload int) (frame, error) {
+	h, err := readFrameHeader(r, maxPayload)
+	if err != nil {
+		return frame{}, err
+	}
+	f := frame{op: h.op, flags: h.flags, reqID: h.reqID}
+	if h.plen > 0 {
+		f.payload = make([]byte, h.plen)
+		if _, err := blitReadFull(blitWireRead, r, f.payload); err != nil {
 			return frame{}, err
 		}
 	}
@@ -325,8 +420,15 @@ func (w *msgW) boolean(v bool) {
 		w.u8(0)
 	}
 }
-func (w *msgW) blob(p []byte) { w.u32(uint32(len(p))); w.b = append(w.b, p...) }
-func (w *msgW) str(s string)  { w.u32(uint32(len(s))); w.b = append(w.b, s...) }
+func (w *msgW) blob(p []byte) {
+	w.u32(uint32(len(p)))
+	w.b = blitAppend(blitMsgAppend, w.b, p)
+}
+
+func (w *msgW) str(s string) {
+	w.u32(uint32(len(s)))
+	w.b = blitAppendString(blitMsgAppend, w.b, s)
+}
 
 type msgR struct {
 	b   []byte
@@ -436,27 +538,27 @@ func unmarshalHello(p []byte) (helloParams, error) {
 // blockServerHandshake (caller side) reads first, then writes. Splitting the order
 // by role means the exchange never deadlocks even on a synchronous transport (a
 // symmetric write-then-read would). Both require an equal version and chunk size.
-func blockClientHandshake(conn net.Conn, local helloParams) (helloParams, error) {
-	if err := sendHello(conn, local); err != nil {
+func blockClientHandshake(w io.Writer, r io.Reader, local helloParams) (helloParams, error) {
+	if err := sendHello(w, local); err != nil {
 		return helloParams{}, err
 	}
-	return recvHello(conn, local)
+	return recvHello(r, local)
 }
 
-func blockServerHandshake(conn net.Conn, local helloParams) (helloParams, error) {
-	peer, err := recvHello(conn, local)
+func blockServerHandshake(w io.Writer, r io.Reader, local helloParams) (helloParams, error) {
+	peer, err := recvHello(r, local)
 	if err != nil {
 		return helloParams{}, err
 	}
-	return peer, sendHello(conn, local)
+	return peer, sendHello(w, local)
 }
 
-func sendHello(conn net.Conn, local helloParams) error {
-	return writeFrame(conn, frame{op: opHello, flags: flagFinal, payload: local.marshal()})
+func sendHello(w io.Writer, local helloParams) error {
+	return writeFrame(w, frame{op: opHello, flags: flagFinal, payload: local.marshal()})
 }
 
-func recvHello(conn net.Conn, local helloParams) (helloParams, error) {
-	f, err := readFrame(conn, int(local.chunkSize)+blockFrameSlack)
+func recvHello(r io.Reader, local helloParams) (helloParams, error) {
+	f, err := readFrame(r, int(local.chunkSize)+blockFrameSlack)
 	if err != nil {
 		return helloParams{}, err
 	}
@@ -482,6 +584,26 @@ type blockCall struct {
 	frames []frame
 	done   chan struct{}
 	err    error
+
+	// Direct delivery (doInto): when dst is non-nil the reader lands the response's
+	// bulk payload — everything past the first metaLen bytes — straight into dst
+	// instead of into a freshly allocated frame payload, and records how much
+	// arrived in n. The metadata prefix still comes back as frames[0].payload. Only
+	// a single-frame, non-error response is delivered this way; anything else falls
+	// back to the allocating path, so a caller can always read frames[0] and use n
+	// only when it asked for direct delivery and got it (delivered).
+	// dst is only safe to write while the reader holds a CLAIM on it. claimed is
+	// taken under blockClient.mu at routing time and released by closing readDone
+	// once the reader has stopped touching dst. A caller abandoning the request
+	// (ctx cancelled) must not return — and so must not let its buffer be reused —
+	// while a claim is outstanding: the p9 server pools read buffers, so a late
+	// write would land in an unrelated request's data. See roundTrip.
+	dst       []byte
+	metaLen   int
+	n         int
+	delivered bool
+	claimed   bool
+	readDone  chan struct{}
 }
 
 // blockClient is the full-duplex request mux the block proxy drives toward the
@@ -490,7 +612,10 @@ type blockCall struct {
 // completion. A response is collected until its flagFinal frame, then delivered —
 // which does not head-of-line-block other reqIDs (each is routed independently).
 type blockClient struct {
-	conn     net.Conn
+	conn net.Conn
+	// br is the ONLY reader of conn. See blockReadBuf for why it exists and why
+	// it is constructed before the handshake rather than after.
+	br       *bufio.Reader
 	maxFrame int
 	inflight chan struct{}
 	features uint32 // negotiated coherence features (local & peer)
@@ -507,7 +632,8 @@ type blockClient struct {
 
 // newBlockClient performs the HELLO handshake and starts the reader loop.
 func newBlockClient(conn net.Conn, local helloParams) (*blockClient, error) {
-	peer, err := blockClientHandshake(conn, local)
+	br := bufio.NewReaderSize(conn, blockReadBuf)
+	peer, err := blockClientHandshake(conn, br, local)
 	if err != nil {
 		return nil, err
 	}
@@ -517,6 +643,7 @@ func newBlockClient(conn net.Conn, local helloParams) (*blockClient, error) {
 	}
 	bc := &blockClient{
 		conn:     conn,
+		br:       br,
 		maxFrame: int(local.chunkSize) + blockFrameSlack,
 		inflight: make(chan struct{}, inflight),
 		features: local.features & peer.features,
@@ -536,6 +663,53 @@ func newBlockClient(conn net.Conn, local helloParams) (*blockClient, error) {
 // parked do release so the p9 server's Handle can drain in-flight handlers on
 // teardown even if the caller endpoint is unresponsive.
 func (bc *blockClient) do(ctx context.Context, op byte, payload []byte) ([]frame, error) {
+	call, err := bc.roundTrip(ctx, op, payload, nil, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	return call.frames, nil
+}
+
+// doParts is do with the request payload split into a small metadata prefix and a
+// bulk body that is written WITHOUT being copied — the write path (opWrite),
+// where the body is a megabyte of the workload's data.
+func (bc *blockClient) doParts(ctx context.Context, op byte, meta, bulk []byte) ([]frame, error) {
+	call, err := bc.roundTrip(ctx, op, meta, bulk, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	return call.frames, nil
+}
+
+// doInto is do with the RESPONSE's bulk delivered straight into dst: the reply's
+// first metaLen bytes come back as the returned frame payload and everything
+// after them is read off the connection into dst. It returns how many bytes
+// landed there, and ok=false if the response could not be delivered that way (an
+// error or streamed reply), in which case the frames are the ordinary allocated
+// ones and the caller must fall back to reading them.
+func (bc *blockClient) doInto(ctx context.Context, op byte, payload []byte, metaLen int, dst []byte) (*msgR, int, bool, error) {
+	call, err := bc.roundTrip(ctx, op, payload, nil, dst, metaLen)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !call.delivered {
+		if len(call.frames) == 0 {
+			return newMsgR(nil), 0, false, nil
+		}
+		return newMsgR(call.frames[0].payload), 0, false, nil
+	}
+	return newMsgR(call.frames[0].payload), call.n, true, nil
+}
+
+// roundTrip sends one request and waits for its response. It blocks on the
+// in-flight semaphore for backpressure and on ctx for cancellation: when ctx is
+// cancelled (e.g. the mount is tearing down), it abandons the request — removing
+// its waiter so a late response frame is discarded — and returns ctx.Err(). The
+// caller (block server) always completes an applied mutation regardless; only the
+// reply is dropped. This is what lets a parked call release so the p9 server's
+// Handle can drain in-flight handlers on teardown even if the caller endpoint is
+// unresponsive.
+func (bc *blockClient) roundTrip(ctx context.Context, op byte, payload, bulk, dst []byte, metaLen int) (*blockCall, error) {
 	select {
 	case bc.inflight <- struct{}{}:
 	case <-ctx.Done():
@@ -546,7 +720,10 @@ func (bc *blockClient) do(ctx context.Context, op byte, payload []byte) ([]frame
 	defer func() { <-bc.inflight }()
 
 	id := bc.nextID.Add(1)
-	call := &blockCall{done: make(chan struct{})}
+	call := &blockCall{done: make(chan struct{}), dst: dst, metaLen: metaLen}
+	if dst != nil {
+		call.readDone = make(chan struct{})
+	}
 	bc.mu.Lock()
 	if bc.readErr != nil {
 		bc.mu.Unlock()
@@ -556,7 +733,7 @@ func (bc *blockClient) do(ctx context.Context, op byte, payload []byte) ([]frame
 	bc.mu.Unlock()
 
 	bc.sendMu.Lock()
-	err := writeFrame(bc.conn, frame{op: op, reqID: id, payload: payload})
+	err := writeFrameParts(bc.conn, frame{op: op, reqID: id, payload: payload}, bulk)
 	bc.sendMu.Unlock()
 	if err != nil {
 		bc.mu.Lock()
@@ -568,30 +745,82 @@ func (bc *blockClient) do(ctx context.Context, op byte, payload []byte) ([]frame
 
 	select {
 	case <-call.done:
-		return call.frames, call.err
+		if call.err != nil {
+			return nil, call.err
+		}
+		return call, nil
 	case <-ctx.Done():
 		// Abandon the waiter; the readLoop drops any late/streaming frames for a
 		// reqID no longer in pending.
 		bc.mu.Lock()
+		claimed := call.claimed
 		delete(bc.pending, id)
 		bc.mu.Unlock()
+		if claimed {
+			// The reader is mid-payload with our buffer. Close the connection so its
+			// ReadFull returns at once, then wait for it to let go — bounded, and the
+			// mount is tearing down, which is what cancelled this context.
+			bc.conn.Close()
+			<-call.readDone
+		}
 		return nil, ctx.Err()
 	case <-bc.closed:
 		return nil, bc.err()
 	}
 }
 
+// readPayload reads a direct-delivery response: the metadata prefix into a fresh
+// small buffer on f, the bulk straight into dst.
+func (bc *blockClient) readPayload(f *frame, dst []byte, metaLen, plen int) (int, error) {
+	f.payload = make([]byte, metaLen)
+	if _, err := blitReadFull(blitWireRead, bc.br, f.payload); err != nil {
+		return 0, err
+	}
+	return blitReadFull(blitWireRead, bc.br, dst[:plen-metaLen])
+}
+
 func (bc *blockClient) readLoop() {
 	for {
-		f, err := readFrame(bc.conn, bc.maxFrame)
+		h, err := readFrameHeader(bc.br, bc.maxFrame)
 		if err != nil {
 			bc.fail(err)
 			return
 		}
+		// Route BEFORE reading the payload: a call that registered a destination
+		// buffer (doInto) has its bulk read straight into it, so a read reply never
+		// allocates and copies a block-sized payload on the way to the kernel.
 		bc.mu.Lock()
-		call := bc.pending[f.reqID]
-		if call == nil {
-			// Unknown/cancelled reqID: drop the frame.
+		call := bc.pending[h.reqID]
+		var claim *blockCall
+		var dst []byte
+		metaLen := 0
+		if call != nil && call.dst != nil && h.flags&flagErr == 0 && h.flags&flagFinal != 0 &&
+			h.plen >= call.metaLen && h.plen-call.metaLen <= len(call.dst) {
+			dst, metaLen, claim = call.dst, call.metaLen, call
+			call.claimed = true
+		}
+		bc.mu.Unlock()
+
+		f := frame{op: h.op, flags: h.flags, reqID: h.reqID}
+		nData := 0
+		if dst != nil {
+			if nData, err = bc.readPayload(&f, dst, metaLen, h.plen); err != nil {
+				close(claim.readDone) // release the buffer BEFORE anyone can observe the failure
+				bc.fail(err)
+				return
+			}
+			close(claim.readDone)
+		} else if h.plen > 0 {
+			f.payload = make([]byte, h.plen)
+			if _, err := blitReadFull(blitWireRead, bc.br, f.payload); err != nil {
+				bc.fail(err)
+				return
+			}
+		}
+
+		bc.mu.Lock()
+		// Re-check: the waiter may have been abandoned while the payload was read.
+		if call = bc.pending[f.reqID]; call == nil {
 			bc.mu.Unlock()
 			continue
 		}
@@ -607,6 +836,9 @@ func (bc *blockClient) readLoop() {
 			close(call.done)
 		case f.flags&flagFinal != 0:
 			call.frames = append(call.frames, f)
+			if dst != nil {
+				call.n, call.delivered = nData, true
+			}
 			delete(bc.pending, f.reqID)
 			bc.mu.Unlock()
 			close(call.done)

@@ -449,12 +449,36 @@ section headings that held nothing else. What remains here is 67 open and 15 par
         delivery now works, verified with a NON-ROOT workload (container 1000 -> host 100999). The
         data dir becomes 0711 (walkable, not listable) only where ids were translated. An
         unmapped id is an error, never a fallback to the container-side number.
-      - **STILL OPEN: incus file deliveries, on ORDERING not mapping.** incus records the map on
-        the INSTANCE, which does not exist when the credential file must be written (it arrives as
-        a disk device in the create request), and the daemon exposes no id-map base to ask
-        beforehand — probed `GET /1.0` and the default profile. Remedy: create -> read map ->
-        write -> attach the disk device -> start, which incus supports for a stopped instance.
-        That is a restructure of incushost's Apply, not a capability flag.
+      - **DONE 2026-08-08: incus file deliveries land.** `deploy.LateIDCredentialBinder`: the
+        server writes with container-side ids and hands the directories to the backend, which
+        creates instances STOPPED, owns the directories once `volatile.idmap.next` exists, and
+        starts them. `BindsCredentialDir` is true; `security.idmap.isolated=true` (per-replica
+        ranges, one shared host directory) is refused by name rather than delivered wrong.
+        Verified live on incus plus docker/containerd/bare/podman-rootless. Original notes kept
+        below because the measurements still document the daemon's behaviour.
+      - **(history) incus file deliveries, on ORDERING not mapping. REMEDY CORRECTED AND
+        MEASURED 2026-08-08.** incus records the map on the INSTANCE, which does not exist when
+        the credential file must be written (it arrives as a disk device in the create request).
+        The earlier note said the daemon exposes no id-map base beforehand; that is right for
+        `GET /1.0` and the default profile but WRONG about the instance: `volatile.idmap.next`
+        IS present on a created-but-never-started instance and equals what `volatile.idmap.current`
+        becomes at first start (verified on two instances). The earlier remedy said "read the map"
+        without naming the key, and reading `.current` — the obvious guess — finds nothing and
+        looks like a dead end.
+        Measured end to end against a live incusd: create (stopped) -> read `volatile.idmap.next`
+        -> chown the host file into that range -> attach the disk device -> start -> readable
+        inside. Two constraints found while measuring: the mount target must NOT be under `/run`
+        (the OCI container tmpfs's over it at start and hides the device), and the map must be
+        read PER INSTANCE, since `security.idmap.isolated=true` allocates per-instance ranges even
+        though a default daemon hands every instance the same one.
+        A SECOND route also works and is much smaller: `incus file push` into a never-started
+        instance, honouring `--uid`/`--gid` (a 0600 file pushed as uid 1000 is readable by a
+        uid-1000 workload). It needs no host path, no id map and no Apply restructure, but writes
+        the credential INTO the rootfs rather than mounting it — not read-only, and outside
+        `CredentialBinder`'s meaning. The two differ in the delivered credential's security
+        properties, so the choice is a design decision rather than a feasibility one.
+        Probes kept at `.agents-workspace/tmp/incus-idmap-probe*.sh`; see the 2026-08-08 JOURNAL
+        entry "Measuring the incus credential-`file` remedy before building it".
       - **STILL OPEN: client-local 9P mounts on a remapping runtime, and the FIRST question is not
         id mapping.** Measured 2026-08-08: on rootless podman the deploy FAILS outright with
         `statfs .../mounts/sess-<id>/m0: permission denied`, before ownership inside the mount is
@@ -3360,3 +3384,270 @@ reference/deploy-backends.md` — the path names the ENGLISH page and records ev
 says nothing about the single-host kernel-9p fast path needing shared propagation when the
 runtime is in another mount namespace. Needs the `ja` and `zh` locales in the same change,
 plus `npm run docs:check` and the translation-freshness record.
+
+## Docs for the health-probe engine (opened 2026-08-08, DONE 2026-08-08)
+
+- [x] **DONE 2026-08-08.** `docs/reference/deploy-backends.md` gained a cross-backend
+      `## Healthchecks` section, with `ja` and `zh` in the same change; the four sentences
+      elsewhere that still said healthchecks were ignored (containerd and bare "known gaps",
+      the incus gap list, `deploy-spec.md`'s `::: warning containerd`, and two lines in
+      `guides/deploying-workloads.md`) are corrected in all three locales.
+      `npm run docs:check` fully clean; freshness recorded for all six pages.
+
+      Writing it exposed a real defect, now fixed: NOTHING read the persisted healthcheck
+      back, so a cornus restart left every already-running workload reporting no health
+      until someone redeployed it. `rearmHealth` (containerd reconcile), a `health.Watch`
+      in bare's reconcile, and a lazy `ensureHealthRearmed` on incus's read paths. See the
+      2026-08-08 JOURNAL entry.
+
+- [x] **DONE 2026-08-08: the incus E2E leg ran end to end.** `make e2e-incus-container
+      E2E_STRICT=1` — all 14 scenarios passed, including `compose-dependson.star`
+      (`web waiting for db (service_healthy)`, so the gate blocked rather than skipping)
+      and `health-restart-rearm.star`.
+
+- [x] **DONE 2026-08-08: the server-restart re-arm has E2E coverage.** A green 14/14 leg
+      still left it uncovered — `health-restart-rearm.star` restarts the DEPLOYMENT, not
+      the SERVER. `deploy-server-restart.star` gained a healthcheck plus baseline and
+      post-restart health assertions (gated to the backends running cornus's own probe
+      engine, since on dockerhost/kubernetes the daemon outlives cornus and the assertion
+      could not fail), and was added to the containerd and incus subsets. Verified on
+      every target the scenario runs on — incus, containerd, bare, docker and kube —
+      and neutralized on all three probing backends (incus, containerd, bare), each
+      failing with the same diagnostic while its baseline still passed. The
+      docker/kube logs carry no health line at all, confirming the gate skips rather
+      than passing for the daemon-owned reason.
+
+## Block-protocol vs raw 9P performance (2026-08-08) — gap CLOSED, follow-ups open
+
+**DONE 2026-08-08.** The no-cache block protocol was losing to the raw 9P splice on the
+docker host-mount path at `0.85x / 0.88x / 1.20x` (write / read / fsync). Four independent
+causes, all fixed (see the 2026-08-08 JOURNAL entry "Closing the block-protocol gap"):
+a walk costing 3 round trips instead of 1 (`p9.DefaultWalkGetAttr`'s ENOSYS was forwarded to
+the p9 server, which falls back to Walk+GetAttr across the link — now resolved caller-side in
+`walkGetAttrLocal`); an unconditional GetAttr per open; a 1 MiB read-back + hash on every
+write whose result no-cache mode discards (`FeatNoCache`); and ~3x allocation/copy
+amplification in the framing layer (`writeFrameParts` / `doInto` / pooled request bodies).
+Now `1.15x / 0.95x / 1.17x faster` — the block protocol writes and fsyncs FASTER than the
+splice and reads at parity.
+
+Also fixed, found on the way: a partial-block write to a file opened O_WRONLY failed EBADF,
+because coherence hashing read the block back through the write-only descriptor. That is an
+ordinary append (`dd`, a shell `>` redirect) on a CACHED `:async` mount. `bsHandle.readAt`
+opens a read-only clone on demand.
+
+- [ ] **Reconsider making the block protocol the default for client-local mounts.** The entry
+      above under "what should the DEFAULT select?" records a 12-15% throughput / 20% fsync
+      cost as the reason not to. That cost is GONE — re-measure before quoting it. Note this
+      is no longer needed for id translation (the raw path got `pipeMappingOwner`), so the
+      question is now purely whether one protocol for both is worth the simplification.
+      Re-measure with `make e2e-container E2E_TARGETS=docker
+      E2E_SCENARIOS=e2e/benchmarks/bench-mount-modes.star CORNUS_E2E_BENCH=1`.
+- [ ] **`go test -race ./pkg/blockcache/` fails `TestDiskStoreRMWDoesNotAllocateAChunkPerWrite`.**
+      Pre-existing and race-only (passes without `-race`); the package was untouched by the work
+      above. Race instrumentation inflates the per-op allocation the test puts a byte ceiling on
+      (~78-80 KB measured against a 64 KB ceiling). Either raise the ceiling under `-race` or
+      skip it there — but the LTM doc for this area tells readers to run `go test -race
+      ./pkg/wire ./pkg/blockcache`, so it fails for anyone who follows it.
+- [ ] **No E2E covers a write-heavy workload on a CACHED `:async` mount.** `async-write-docker`
+      runs with the cache off, which is why the O_WRONLY read-back bug above shipped: it is
+      unreachable in no-cache mode and the cached path has only unit coverage. A scenario that
+      configures `--file-cache-dir` and `dd`s a file larger than one 1 MiB block would have
+      caught it.
+
+## E2E: multi-target runs collide on the CNI IPAM store (opened 2026-08-08)
+
+- [ ] `make e2e-container E2E_TARGETS="docker containerd bare"` fails on the bare leg with
+      `10.4.0.2 has been allocated to cornus-creds-env-0, duplicate allocation is not allowed`.
+      containerd and bare share the host-local CNI IPAM store under `/var/lib/cni` and deploy
+      the same instance names, so the earlier leg's reservation collides with the later one.
+      **Measured, not inferred:** bare passes ALONE with the same scenario
+      (`.agents-workspace/tmp/creds-bare-alone.log`), and fails only after containerd has run in
+      the same container.
+
+      Not specific to credentials — any multi-target run of a scenario whose deployment names
+      collide can hit it, and it reads as an inexplicable flake. Candidate fixes: give each
+      target its own CNI conf/data dir, or reap the IPAM reservations at target teardown in
+      `entrypoint.sh`. Verify by running the two targets together and watching this exact error
+      disappear, since a green single-target run proves nothing about it.
+
+## incus managed volumes need idmapped mounts the E2E runner lacks (opened 2026-08-08)
+
+- [ ] `web-fs.star` cannot run on the incus target: its fixture uses managed volumes, cornus
+      creates those with `security.shifted: true` (deliberate — replicas of one deployment
+      need not map ids the same way), and a shifted volume requires IDMAPPED MOUNTS, which
+      the nested containerized runner's kernel does not provide. Fails at compose up with
+      `Failed to setup device mount "cornus-vol-0": idmapping abilities are required but
+      aren't supported on system`.
+
+      **Measured, not inferred:** restoring the atomic `Start: true` reproduced the identical
+      error at create instead of start, so the create/start split is not the cause. No incus
+      scenario had ever exercised a managed volume, which is why it had never surfaced.
+
+      Open questions, in order: does a real (non-nested) host hit this at all — i.e. is this
+      only a runner limitation? If it also affects real hosts, should cornus fall back to an
+      unshifted volume when the pool cannot idmap, and what does that cost when replicas
+      genuinely differ? `deploy-fsop-incus.star` covers the operator without a volume, so the
+      capability is verified either way; this is about volumes on incus, not about FSOp.
+
+## Health-engine coverage gaps still open (opened 2026-08-08)
+
+- [ ] **`start_interval` has no test at any level.** Not in `health-unhealthy.star`, not in
+      `pkg/deploy/healthengine/healthengine_test.go` (grepped, zero hits by any spelling). It is
+      documented as the field cornus's engine honours and kubernetes cannot, and
+      `docs/reference/deploy-spec.md` carries a `::: warning kubernetes` block saying so — so a
+      documented differentiator currently rests on nothing. Cheapest fix: a unit test at
+      millisecond durations asserting the probe cadence is the START interval before the first
+      success and the normal interval after. Neutralize by making resolve() ignore
+      hc.StartInterval.
+
+- [ ] **FSOp `get` / `put` / `copy` are not exercised live on incus.** `deploy-fsop-incus.star`
+      covers stat/list/mkdir/remove/rename. The three missing ones are the byte-streaming
+      path through `SFTPFS.Pack`/`Unpack`, which the FS contract does round-trip — but against
+      a pipe-backed local sftp server, not incusd's forkfile helper.
+
+- [ ] **The `security.idmap.isolated=true` credential refusal is unit-only**, and credential-file
+      REFRESH (the rotating-credential goroutine, which re-chowns via the now-working
+      `.current` path) has never run on incus at all.
+
+## Mount-path performance, phase 0 done (2026-08-09)
+
+Plan: `~/.claude/plans/tidy-growing-wreath.md`. Phase 0 (make the benchmark model the
+production transport) is DONE — see the 2026-08-09 JOURNAL entry. Open steps:
+
+- [x] **DONE 2026-08-09: `third_party/websocket` fork — `DialOptions.WriteBufferSize`.**
+      Caller-side syscalls for a 16 MiB read: block 4274 -> 194, raw 9P 4322 -> 242 (22x;
+      it is a transport cost, so both protocols get it). Sized to one yamux frame.
+      One file, fifteen lines; `write.go` untouched because masking is chunk-size
+      independent. Carries a provenance README, `cornus.patch` + `regen-patch.sh`, a CI
+      faithfulness gate, and ISC-optional per-file change markers. See the 2026-08-09
+      JOURNAL entry.
+
+      **Do not re-propose `http.Transport.WriteBufferSize`.** After a 101 upgrade
+      `net/http` hands back `newReadWriteCloserBody(pc.br, pc.conn)` — the write half is the
+      raw conn, so that knob never touches these writes. Interposing a buffering `net.Conn`
+      is also out: nothing there knows where a frame ends, and flush-on-read cannot rescue
+      it because yamux parks a goroutine in `Read`.
+
+      Follow-ups:
+      - [ ] **Offer `WriteBufferSize` upstream.** Expect resistance — coder/websocket's
+            pitch is a minimal API and this is the kind of knob it removed on purpose — so
+            lead with the measurement (one syscall per 4 KiB for any client message,
+            independent of framing) rather than with the option.
+      - [ ] **Take v1.9.0 when it ships**, for the SIMD masking that v1.8.15 compiles but
+            disables behind a `TODO`. Worth having, NOT a substitute: masking is ~2.4% of
+            the profile against ~16% for the flush loop this fork addresses.
+
+- [x] **DONE 2026-08-09: `third_party/p9` fork — Twrite payloads served from the
+      connection's buffer pool.** Block seq-write allocation 17.9 -> 5.3 MB per 16 MiB, and
+      raw 9P 16.8 -> 5.3 MB (both run a p9 server). Mirrors what upstream already does for
+      reads. Carries `cornus.patch` + `regen-patch.sh` + a CI faithfulness gate, a provenance
+      README, Apache section 4(b) per-file notices, and the `replace` in both `go.mod` and
+      `pkg/wire/sqliteab/go.mod`. See the 2026-08-09 JOURNAL entry.
+
+      Follow-ups it created:
+      - [ ] **Offer the change upstream.** It adds no exported API and is the write-side
+            twin of `rreadServerPayloader`, so it is the most upstreamable thing here.
+            Delete the fork and the two `replace` lines the day it lands in a release.
+      - [ ] **Retrofit the faithfulness gate to `third_party/yamux`.** It is far larger than
+            p9 and has no machine check that it matches upstream apart from its intended
+            changes; `third_party/p9/regen-patch.sh` is the pattern.
+      - [ ] **Every future nested module reaching `pkg/wire` needs BOTH replaces**
+            (yamux and p9) or it silently tests upstream.
+
+- [x] **DONE 2026-08-09: GC-proof reuse for `blockServer.reqScratch` and `opScratch`.**
+      `scratchList` (`pkg/wire/blockscratch.go`) — a small buffered channel the GC cannot
+      empty, with a `sync.Pool` overflow tier. seq-write allocation 22.5 -> 17.9 MB,
+      seq-read 8.5 -> 4.7 MB (now at raw 9P's level); ws seq-read 16.4 -> 9.3 MB, below
+      raw 9P's. See the 2026-08-09 JOURNAL entry.
+
+      **Open sub-item:** the retained depth is 2 and only "GC-proof" is evidenced — keep=1
+      and keep=4 measure identically on every workload the in-process harness produces. 2
+      covers the structure of `loop()` (it can hold request N+1's buffer while a handler
+      holds N's); anything deeper is a guess costing ~1 MiB pinned per mount per slot. The
+      byte-ceiling test CANNOT distinguish depths, because it drives writes synchronously.
+      Settle it with a pipelining client — the real kernel under `cache=mmap` writeback via
+      `TestKernelMountModes` — before changing the constant in either direction.
+- [x] **DONE 2026-08-09: buffered receive** on both frame loops. `blockReadBuf = 8192`
+      (4096 would just miss a page write plus meta). Syscalls per 16 MiB: seq-write
+      347 -> 308, seq-read 323 -> 294, small-sync 33 -> 30. The staged-copy cost it adds is
+      now measurable as the `blit-buf-copy` category (0.81% of payload written), pinned by
+      `TestBufferedReceiveDoesNotStageBulk` with both a ceiling and a floor. See the
+      2026-08-09 JOURNAL entry.
+
+## Layered buffer pools (2026-08-09) — tier 0 done, rest open
+
+Plan: `~/.claude/plans/buffer-pools-and-vectored-io.md`. Two consumer populations,
+measured: BULK (128 KiB-1 MiB, few in flight) where pools exist and fail, and
+SMALL-FREQUENT (16 B-4 KiB, per request) where pools do not exist.
+
+**Measurement trap, do not repeat:** `go test -bench` matches each `/`-separated element
+UNANCHORED, so `-bench BenchmarkMount/local/...` also runs `ws-local`. The `local`
+profile has no yamux, so a blended profile attributes yamux costs to it. Always anchor:
+`'^BenchmarkMount$/^local$/^seq-write$/^block$'`.
+
+- [x] **DONE 2026-08-09: GC-proof tier 0 in front of p9's `readBufPool`.** One
+      `atomic.Pointer` slot per connection. `local/seq-write` 5.12 -> 2.18 MB/op,
+      `ws-local` 9.28 -> 6.3 MB/op, pool misses 82.1 -> 19.7 MB. See the JOURNAL entry.
+- [x] **MEASURED 2026-08-09: yamux `Stream.recvBuf` growth is PER-STREAM, so a mount
+      amortises the allocation rate to nothing — no action needed for mount throughput.**
+      `BenchmarkYamuxStreamChurn` (32 MiB total, varying stream count): 0.52x allocated per
+      byte at 1 stream vs 3.26x at 512, a 6.3x spread at identical bytes moved.
+
+- [ ] **BUT the measurement turned up a footprint problem that does NOT amortise.**
+      `TestRecvBufHighWaterMark` (yamux fork): a single stream's receive buffer grows to
+      whatever is in flight — 8 MiB measured for an 8 MiB transfer — bounded only by the
+      16 MiB stream window cornus configures, and **nothing ever releases it** (`Shrink()`
+      exists; cornus never calls it). The RECEIVER buffers, and for a client-local mount the
+      bulk direction is read replies flowing caller -> server, so this is the **cornus
+      server's** memory, one buffer per mount, up to 16 MiB each. Ten mounts is up to
+      160 MiB resident whether or not they are busy.
+
+      **RESOLVED 2026-08-09** by pooling the receive buffers in the yamux fork
+      (`third_party/yamux/recvbufpool.go`) and recycling where the reader observes EOF.
+      **NOTE the correction:** an earlier version recycled at stream TEARDOWN
+      (`Session.closeStream`) and was wrong twice — it deadlocked (closeStream runs with
+      `stateLock` held, since processFlags' defers run LIFO, so taking `recvLock` there
+      closes an ABBA cycle against a reader in `sendWindowUpdate`) and then lost data
+      intermittently in `TestHalfCloseSessionShutdown`. Both were only visible under
+      `-race`. Do not re-hook it to a lifecycle event: the operation needs the DATA fact
+      that no more bytes are coming and the reader is done, which is exactly what
+      returning `io.EOF` asserts.
+      Release-on-drain was tried first and measured 3x WORSE for a single long-lived
+      stream (17.3 -> 52.9 MB per 32 MiB) because a bulk stream drains and refills
+      continuously. Final numbers: 512 streams 109.5 -> 6.3 MB with throughput up ~3x;
+      64 streams 86.9 -> 36.8 MB; the single-stream row costs ~28% MORE allocation than
+      baseline (17.3 -> 22.2 MB), which is the price of releasing and re-acquiring. The
+      production mount shape is unaffected. See both 2026-08-09 JOURNAL entries — the
+      second is a correction to the first.
+
+      Deliberately GC-DRAINABLE, the opposite of p9's tier-0 slot: here the collector
+      emptying the pool is the mechanism that returns an idle mount's memory, so a
+      retained tier would pin exactly what this releases.
+
+- [ ] **The high-water mark itself is unchanged and still worth a decision.** A busy
+      stream's receive buffer still grows to whatever is in flight, bounded only by the
+      16 MiB `MaxStreamWindowSize` cornus configures, and that is per stream on the
+      RECEIVING side — for mounts, the cornus server. Pooling stops each stream paying the
+      doubling ladder to get there; it does not reduce the mark. Reducing it means
+      reducing the window, which was raised deliberately for throughput
+      (`pkg/wire/session.go`), so it is a throughput-vs-footprint trade nobody has priced.
+- [ ] **Small classes: add pools where there are none** — `blockServer.readRequest`
+      below `bigRequest` (16.8% of the small-op path), `blockClient.readLoop`'s reply
+      payload (5.8%), `msgW` request metadata (2.6%), and p9's per-message
+      `make(net.Buffers, 0, 3)` (8.4%). Plain `sync.Pool` per class, **no retained tier** —
+      a small miss costs nothing, the per-P private slot already makes it near-free, and GC
+      drain is a feature there.
+- [ ] **If a general size-classed allocator is built, derive the classes from protocol
+      constants, not powers of two.** `chunkSize + blockFrameSlack` (1 MiB + 4096) and
+      yamux's `MaxDataFrame + headerSize` (128 KiB + 12) both sit JUST over a power of two,
+      so a naive ladder doubles the memory pinned by exactly the buffers being bounded.
+- [ ] **Copy elimination on the client send path (destructive masked write).** Masking is
+      an involution, so the payload can be masked in place and written with no staging copy;
+      the restore is what costs, so the win needs a write permitted to leave the buffer
+      masked. Combined with removing yamux's send-side frame copy, the bulk send path goes
+      from three passes per byte to one. **Sharp:** a caller reusing its buffer gets silent
+      wire corruption, so it must be a separate entry point, never `Conn.Write`'s behaviour.
+- [ ] **`net.Buffers` is NOT the lever** — it only writevs for `*net.TCPConn`/`*net.UnixConn`,
+      and production runs over `websocket.NetConn`; inside coder/websocket the client's
+      destination is net/http's `readWriteCloserBody`, which cannot implement the unexported
+      method either. Recorded so it is not re-proposed.

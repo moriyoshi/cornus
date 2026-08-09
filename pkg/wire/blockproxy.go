@@ -51,7 +51,14 @@ func ServeBlockProxy(kernelConn, remoteStream net.Conn, cache *blockcache.Cache,
 		chunk = cache.ChunkSize()
 		store = cache.Store()
 	}
-	local := helloParams{version: blockProtoVersion, chunkSize: uint32(chunk), maxInflight: blockMaxInflight, features: o.features}
+	// In NO-CACHE mode the negotiated set is exactly FeatNoCache: every coherence
+	// scheme exists to keep a cache correct, and there is no cache, so requesting
+	// one would only buy the caller work whose result is discarded here.
+	feats := o.features
+	if noCache {
+		feats = FeatNoCache
+	}
+	local := helloParams{version: blockProtoVersion, chunkSize: uint32(chunk), maxInflight: blockMaxInflight, features: feats}
 	client, err := newBlockClient(remoteStream, local)
 	if err != nil {
 		return
@@ -120,7 +127,15 @@ const _ = uint(subBlockSize-blockcache.SubBlockSize) + uint(blockcache.SubBlockS
 func (a *blockAttach) newHandle() uint64 { return a.nextH.Add(1) }
 
 func (a *blockAttach) do(op byte, payload []byte) (*msgR, error) {
-	frames, err := a.client.do(a.ctx, op, payload)
+	return firstFrame(a.client.do(a.ctx, op, payload))
+}
+
+// doParts is do with the request's bulk body written without a copy.
+func (a *blockAttach) doParts(op byte, meta, bulk []byte) (*msgR, error) {
+	return firstFrame(a.client.doParts(a.ctx, op, meta, bulk))
+}
+
+func firstFrame(frames []frame, err error) (*msgR, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -277,8 +292,16 @@ func (f *blockProxyFile) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 	qid := getQID(r)
 	iounit := r.u32()
 
+	// NO-CACHE mode: everything below exists to key and validate a cache entry, so
+	// with no cache the GetAttr is a round trip whose whole result is discarded.
+	// Opening a file is one of the commonest operations a workload performs, so
+	// this is a per-open round trip the raw 9P splice never spends.
+	if f.a.noCache {
+		return qid, iounit, nil
+	}
+
 	_, mask, attr, gerr := f.GetAttr(p9.AttrMask{Size: true, MTime: true, Mode: true})
-	if gerr == nil && mask.Mode && attr.Mode.IsRegular() && !f.a.noCache {
+	if gerr == nil && mask.Mode && attr.Mode.IsRegular() {
 		f.id = f.fileID()
 		f.cacheable = true
 		size := int64(attr.Size)
@@ -376,7 +399,7 @@ func (f *blockProxyFile) ReadAt(p []byte, off int64) (int, error) {
 		if inData >= int64(len(data)) {
 			break
 		}
-		n := copy(p[total:end-off], data[inData:])
+		n := blitCopy(blitUserCopy, p[total:end-off], data[inData:])
 		total += n
 		pos += int64(n)
 		if n == 0 {
@@ -595,27 +618,59 @@ func (f *blockProxyFile) readBlockFromCaller(b int) ([]byte, uint64, uint64, err
 // opReadRange is answered unconditionally by the caller's block server — it is
 // not behind feature negotiation — and imposes no alignment, only
 // 0 < subLen <= chunkSize, which the clamp below satisfies.
+//
+// The range is NOT clamped to the end of the covering block. It used to be, and
+// that turned every read crossing a block boundary into a short read plus a
+// second request for the remainder: the kernel reads at msize granularity, which
+// is a few hundred bytes short of the 1 MiB block, so a sequential reader
+// alternated a full-size read with a tiny one and paid an extra round trip per
+// megabyte. Block alignment is a CACHE requirement (the store's presence bitmaps
+// are per sub-block within a block) and this path has no cache — the caller reads
+// the file at an absolute offset either way.
 func (f *blockProxyFile) rawReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	b := int(off / f.a.chunkSize)
 	inChunk := off - int64(b)*f.a.chunkSize
-	// One request never spans two blocks; a short read is legal here and the
-	// client re-issues for the remainder.
+	// A short read is legal here and the client re-issues for the remainder; the
+	// only bound is the one the wire imposes (a frame holds one block of data).
 	want := int64(len(p))
-	if rem := f.a.chunkSize - inChunk; want > rem {
-		want = rem
+	if want > f.a.chunkSize {
+		want = f.a.chunkSize
 	}
-	data, _, err := f.readRangeFromCaller(b, inChunk, want)
+	// Direct delivery: the reply's bytes are read off the connection straight into
+	// p, the buffer the p9 server will hand back to the kernel. The allocating
+	// route stays as the fallback for a reply that cannot be delivered that way
+	// (an error, or a peer that streams it).
+	var w msgW
+	w.u64(f.h)
+	w.u64(uint64(b))
+	w.u32(uint32(inChunk))
+	w.u32(uint32(want))
+	r, n, ok, err := f.a.client.doInto(f.a.ctx, opReadRange, w.b, readRangeMetaLen, p[:want])
 	if err != nil {
 		return 0, err
 	}
-	if len(data) == 0 {
+	if !ok {
+		_ = r.u64() // blockIdx echo
+		_ = r.u32() // subOff echo
+		_ = r.u64() // seq
+		data := r.blob()
+		if len(data) == 0 {
+			return 0, io.EOF
+		}
+		return blitCopy(blitUserCopy, p, data), nil
+	}
+	if n == 0 {
 		return 0, io.EOF
 	}
-	return copy(p, data), nil
+	return n, nil
 }
+
+// readRangeMetaLen is the fixed prefix of an opReadRange reply that precedes the
+// data: blockIdx(8) + subOff(4) + seq(8) + the blob's length word(4).
+const readRangeMetaLen = 24
 
 // WriteAt implements p9.File.WriteAt: write-through to the caller, then keep the
 // server-side cache coherent by one of three negotiated schemes — a whole-block
@@ -623,11 +678,14 @@ func (f *blockProxyFile) rawReadAt(p []byte, off int64) (int, error) {
 // (FeatSubBlockHash), or a hash-free write-through reconciled in a batch at fsync
 // (FeatDeferHash) — and keep the size + hint current.
 func (f *blockProxyFile) WriteAt(p []byte, off int64) (int, error) {
+	// The data rides as the frame's bulk part: same wire bytes (blob = u32 length
+	// then the bytes), but p is written straight from the kernel's buffer instead
+	// of being appended into a request payload — a block-sized copy per write.
 	var w msgW
 	w.u64(f.h)
 	w.u64(uint64(off))
-	w.blob(p)
-	r, err := f.a.do(opWrite, w.b)
+	w.u32(uint32(len(p)))
+	r, err := f.a.doParts(opWrite, w.b, p)
 	if err != nil {
 		return 0, err
 	}

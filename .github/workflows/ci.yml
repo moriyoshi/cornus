@@ -158,6 +158,72 @@ jobs:
         # bulk path covered in CI.
         run: cd third_party/yamux && go test -skip '^TestSendData_VeryLarge$' ./...
 
+      - name: p9 fork unit tests (upstream suite + the payload-pooling additions)
+        # Same rationale as the yamux steps above: the fork is a nested module, so
+        # the main `go test ./...` never runs its own tests. This runs upstream's
+        # p9 suite — so a fork change that breaks core 9P fails here — plus
+        # twrite_payload_test.go, which covers the one behavioural change (payload
+        # exactness across sizes, that a cached message drops its connection, and
+        # the allocation ceiling the fork exists for).
+        #
+        # The package list is explicit rather than ./... because fsimpl/localfs's
+        # TEST does not build on v0.4.1 under a current toolchain: its dependency
+        # golang.org/x/tools@v0.16.1 has a constant expression the compiler now
+        # rejects. Pristine upstream fails identically, so this is upstream's and
+        # not the fork's — see third_party/p9/README.md.
+        run: cd third_party/p9 && go test -race ./p9/... ./linux/... ./vecnet/...
+
+      - name: p9 fork allocation ceiling (no race; the reason the fork exists)
+        # Companion to the -race pass above. The allocation measurement skips under
+        # `-race` — instrumentation allocates 200-365 KB/op there, which swamps the
+        # ~36 KB/op being measured and straddles any ceiling tight enough to catch
+        # the regression it names. Without this second pass the one test that
+        # actually guards the fork's purpose would never run in CI.
+        run: cd third_party/p9 && go test -run TestTwritePayload -v ./p9/
+
+      - name: p9 fork is faithful to upstream apart from its recorded patch
+        # The check the yamux fork lacks, and the thing that turns "is this vendored
+        # copy honest?" from a review promise into a gate. Regenerating the diff
+        # against pristine upstream must reproduce the committed cornus.patch byte
+        # for byte, so a stray edit, an accidental reformat, or an unrelated
+        # "improvement" slipped in beside the intended change all fail the build.
+        run: |
+          sh third_party/p9/regen-patch.sh > /tmp/p9-actual.patch
+          diff -u third_party/p9/cornus.patch /tmp/p9-actual.patch
+
+      - name: websocket fork unit tests (upstream suite + WriteBufferSize)
+        # Upstream's own suite, so a fork change that breaks core WebSocket fails
+        # here, plus writebuffersize_test.go: that the size reaches the flush loop,
+        # that the masked bytes are identical at any buffer size, and that a
+        # custom-sized writer never enters the shared (size-blind) pool.
+        #
+        # No `go vet` over this module: v1.8.15 emits two mask_arm64.s symbol
+        # warnings on arm64 that pristine upstream emits too.
+        #
+        # TestWasm is skipped: it shells out to `go test -exec=wasmbrowsertest`,
+        # and upstream provisions that binary in its own ci/test.sh (`go install
+        # github.com/agnivade/wasmbrowsertest`), which this job does not. It also
+        # only runs when $CI is set, so it is invisible locally. The compile it
+        # was providing is covered deterministically by the next step instead, so
+        # skipping it here costs no coverage and adds no headless-browser
+        # dependency. Same shape as the yamux step's -skip above.
+        run: cd third_party/websocket && go test -skip '^TestWasm$' ./...
+
+      - name: websocket fork still builds for js/wasm
+        # The js build is a real target of this module (ws_js.go defines a wholly
+        # separate Conn), and a fork addition without a `!js` constraint joins it
+        # and breaks it. writebuffersize_test.go did exactly that, and nothing in
+        # a native build or a local `go test ./...` could see it.
+        #
+        # This is upstream's own check, verbatim from ci/lint.sh:9. It type-checks
+        # test files too, which is where the defect was, and needs no browser.
+        run: cd third_party/websocket && GOOS=js GOARCH=wasm go vet ./...
+
+      - name: websocket fork is faithful to upstream apart from its recorded patch
+        run: |
+          sh third_party/websocket/regen-patch.sh > /tmp/ws-actual.patch
+          diff -u third_party/websocket/cornus.patch /tmp/ws-actual.patch
+
       - name: qosab in-process QoS harness smoke (run each benchmark once)
         # qosab lives in the main module (so the gate compile-checks it), but its
         # benchmarks never execute there. `-benchtime 1x` runs each once over the

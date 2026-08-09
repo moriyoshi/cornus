@@ -399,6 +399,28 @@ def read_readme_upstream(d):
     return None
 
 
+def read_readme_modified(d):
+    """Whether the copy is MODIFIED, from a `| Modified | yes |` row in its README.
+
+    This is read rather than inferred because the notices must say so for every
+    license, not just the one that happens to compel it. It used to be inferred
+    from the license category (MPL => modified), which was true only because the
+    single modified copy at the time was MPL; an Apache-2.0 or ISC fork would have
+    been listed as if it were a pristine copy, which is the exact thing Apache
+    section 4(b) is about. Absent row means unmodified.
+    """
+    for fn in ("README.md", "README"):
+        p = os.path.join(d, fn)
+        if not os.path.exists(p):
+            continue
+        with open(p, errors="replace") as f:
+            for line in f:
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) == 2 and cells[0].lower() == "modified":
+                    return cells[1].strip().lower() in ("yes", "true")
+    return False
+
+
 def scan_vendored(repo):
     tp = os.path.join(repo, "third_party")
     out = []
@@ -423,7 +445,8 @@ def scan_vendored(repo):
             # would attribute the component to a literal "None".
             origin = read_readme_upstream(d)
         out.append({"path": os.path.relpath(d, repo), "origin": origin,
-                    "license": lic, "license_file": fn, "category": category(lic)})
+                    "license": lic, "license_file": fn, "category": category(lic),
+                    "modified": read_readme_modified(d)})
     return out
 
 

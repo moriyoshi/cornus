@@ -6,9 +6,12 @@ Cornus contributors, licensed under the Apache License, Version 2.0.
 
 This product bundles third-party components. The distributed binary includes
 software under the Apache License 2.0, the MIT, ISC and BSD licenses, the
-Unlicense, and the Mozilla Public License 2.0 (MPL-2.0). The MPL-2.0 components
-include a modified copy of github.com/hashicorp/yamux, vendored under
-third_party/yamux/ with its original license retained. See
+Unlicense, and the Mozilla Public License 2.0 (MPL-2.0). Three of those components
+are MODIFIED copies, each vendored under third_party/ with its original license
+retained and its changes described in a README beside it and marked in the files
+they touch: github.com/hashicorp/yamux (MPL-2.0, third_party/yamux/),
+github.com/hugelgupf/p9 (Apache-2.0, third_party/p9/) and
+github.com/coder/websocket (ISC, third_party/websocket/). See
 THIRD_PARTY_NOTICES.md for the full list of components, their versions and
 licenses, and the complete license texts.
 

@@ -31,4 +31,11 @@ require (
 
 replace cornus => ../../..
 
+// The in-repo p9 fork, for the same reason as the yamux replace below: without
+// it this harness measures UPSTREAM p9, and the payload-pooling it exists to
+// measure would silently not be there.
+replace github.com/hugelgupf/p9 => ../../../third_party/p9
+
+replace github.com/coder/websocket => ../../../third_party/websocket
+
 replace github.com/hashicorp/yamux => ../../../third_party/yamux

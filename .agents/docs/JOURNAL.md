@@ -5649,3 +5649,2247 @@ at the end is current.
 - **A test must not check an assumption against itself.** The 9P offset tests drive
   the real p9 encoder and decoder for exactly this reason; a test that encoded the
   message with the offsets it asserts on would have passed with them wrong.
+
+## 2026-08-08 — A health-probe engine for containerd, bare and incus (phases 1-5)
+
+Three backends implemented no `deploy.HealthReporter`, so they dropped the
+healthcheck with a warning. They now run the probes themselves.
+
+### The premise was checked before it was built on
+
+containerd's warning said "containerd has no healthcheck engine and nothing in
+cornus consumes health". Half of that had gone stale, and the stale half was the
+whole reason to do this: health IS consumed — a compose file with
+`depends_on: condition: service_healthy` is REFUSED UP FRONT on a backend that
+reports no health (`composecli/reconcile.go`, `errHealthUnsupported`). So an
+ordinary compose project could not deploy to these backends at all.
+
+Measured before writing anything, which is what makes the later pass mean
+something:
+
+```
+cornus: error: service "web" depends on "db" with condition: service_healthy, but
+the "containerd" deploy backend does not report container health (it has no probe
+engine ...)
+```
+
+After: `web  waiting for db (service_healthy)` then a pass. The `waiting` line
+matters as much as the pass — it shows the gate WAITED on health rather than the
+condition being skipped, which is how this could have gone green for the wrong
+reason.
+
+### `pkg/deploy/healthengine`
+
+A probe loop per instance, shaped like barehost's restart supervisor (cancel func
+per instance under a mutex, watch / unwatch / stopAll) because that is the pattern
+the bare backend already uses and the two now sit side by side there.
+
+The state machine is pinned to DOCKER's rather than to something merely
+reasonable, since `service_healthy` compares against Docker's vocabulary. Two
+rules carry the risk:
+
+- a failure inside `StartPeriod` does not count toward `Retries`;
+- **a success ENDS the start period** — once seen healthy, later failures count
+  even if the period has not elapsed.
+
+"One probe in flight per instance" falls out of the loop's shape (sleep, probe,
+update, sequentially) rather than needing a guard.
+
+### The neutralization sweep found a test certifying nothing
+
+Breaking each rule in turn, one came back **NO TEST FAILED**: removing `fails = 0`
+broke nothing. `TestRetriesMustBeConsecutive` scripted fail, fail, pass, then fail
+forever and asserted it eventually goes unhealthy — which it does either way. It
+asserted that the machine ARRIVED, never that the reset happened.
+
+Rewritten so the script never gives `Retries` consecutive failures (two, a
+success, two more) and asserts the flip NEVER happens: with the reset it stays
+healthy, without it the four accumulate past the threshold. Deterministic, where
+counting probes to catch the transition would have raced the poll interval. The
+other five neutralizations failed correctly.
+
+### Two deliberate deviations from the approved plan
+
+**No `discardConn`.** The plan routed probes through `ExecCreate`/`ExecStart` with
+a fake connection. Those maintain a client-facing session — registry entry, stdin
+pump, TTY resize, stdcopy framing — that a probe has no use for, and every probe
+would leave a registry entry behind. containerd's `cio.NullIO` and bare's existing
+`copyIO` discard output natively, so the fake connection was never needed.
+
+**The healthcheck is PERSISTED, not remembered.** The plan accepted that probe
+STATE resets on a server restart (Docker keeps its own in a daemon that outlives
+cornus). But keeping only state in memory would also have lost the healthcheck
+DEFINITION, so health would never come back for an already-deployed workload —
+surfacing much later as a compose dependency that hangs, not as anything that
+looks like a fault. It now rides on the container: a LABEL on containerd
+(`cornus.healthcheck`), the instance RECORD on bare, the instance CONFIG on incus
+(`user.cornus.healthcheck`). `syncHealth` reads it back, so the deploy path and
+the restart path resolve it identically and cannot diverge.
+
+### incus was the one the plan expected to drop, and it is the best of the three
+
+Phase 4 was written as droppable "if its exec path proves unsuitable for
+short-lived commands". The opposite: incus's operation metadata carries the
+process's actual RETURN CODE, where bare's OCI runtime only reports non-zero as an
+error, so a failing probe and an unrunnable one are indistinguishable there
+(harmless — both are failed probes — but less precise).
+
+Per-backend wrinkles worth keeping:
+
+- **containerd**: exec ids must be unique among a task's live processes, so probes
+  use a counter; cleanup runs under `context.WithoutCancel`, because on the timeout
+  path the probe's own context is already dead and a `Delete` on it would leak both
+  the process and its exec id.
+- **incus**: `op.Wait()` takes no context, so a hung probe would pin its goroutine
+  for the life of the deployment. It races the wait against the probe deadline and
+  cancels the operation.
+- **all three**: a nil `*Engine` is now a working "runs no probes" (every method a
+  no-op, `State` returning ""), because incus's tests construct `&Backend{}`
+  directly. That turns a missing feature into a benign default instead of a panic
+  on the Status path.
+
+### The existing tests behaved exactly as designed
+
+Each backend had three guards fire on the behaviour change: two asserting the
+"ignores healthcheck" warning, then `TestEveryDeploySpecFieldIsMappedOrWarned`
+demanding that Healthcheck be declared either warned-about or SUPPORTED. Moving it
+into `supportedSpec()` — which asserts apply stays silent — is the honest
+resolution, and each removed warning test was replaced by one pinning the new
+contract (the check is recorded where the restart path will look for it), so the
+old assertion was not merely deleted.
+
+### Verification
+
+- `go test ./pkg/deploy/healthengine/` — 13 tests, millisecond-scale, race-clean over 3 runs.
+- `health-restart-rearm.star` (new): healthy -> "" after stop -> healthy again.
+  The EMPTY reading is asserted too, because without it the scenario would also
+  pass on a backend that simply never disarmed. Green on all three backends.
+- `compose-dependson.star` green on containerd, bare and incus.
+- Full legs with both scenarios registered: **containerd 16/16, bare 20/20**. The
+  incus leg was not run end to end — both scenarios passed there individually and
+  its registration is structurally identical, but that is not the same as having
+  measured it.
+
+### Left
+
+Phase 6: docs. `docs/reference/deploy-backends.md` plus `ja` and `zh` in the same
+change, recording that these three now report health (and that probe state, not
+the check itself, resets across a server restart), with `npm run docs:check` and
+translation freshness.
+
+## Phase 6: documenting the health engine, and the gap that writing it exposed (2026-08-08)
+
+Phase 6 was meant to be docs only. Writing them found a real defect, so this entry
+covers both.
+
+### The defect: nothing ever read the persisted healthcheck back
+
+Phases 2-4 persisted each workload's healthcheck where the workload lives — a
+container label on containerd, the instance record on bare, the instance config on
+incus — and the code comments state the reason plainly: losing the DEFINITION
+would mean health never came back for an already-deployed workload after a cornus
+restart. That reasoning was sound. The follow-through was missing.
+
+`syncHealth` is called only from `Apply` and `Start`. containerd's startup
+reconcile (`reconcile_linux.go`) and bare's (`supervise_linux.go`) did not call it,
+and incus has no startup pass at all. So a cornus restart left every already-running
+workload reporting no health until someone redeployed it — silent, because the
+workload keeps running, and surfacing much later as exactly the hanging
+`depends_on: service_healthy` the persistence was meant to prevent. The plan's
+"Risks" section predicted the state resetting to `starting`; the actual behavior was
+worse than the predicted risk, and nothing had measured it.
+
+This is what writing the documentation is for. The paragraph I was drafting —
+"probing resumes for instances that are still running" — was a claim about the
+code, and checking it before writing it is what turned it up.
+
+Fixes, one per backend, each shaped by that backend's own notion of desired state:
+
+- **containerd**: `rearmHealth` in the reconcile loop, guarded by a new
+  `desiredRunning(labels)`. A live task arms; so does one the restart monitor is
+  about to resurrect (the pass repairs its netns and deliberately does not start
+  it). An explicitly-stopped container, or one with no restart policy at all, does
+  not — `Stop` sets `ExplicitlyStoppedLabel` only when a policy label exists, so
+  "no policy and not running" is the only signal a stopped `restart: no` workload
+  leaves behind.
+- **bare**: one `b.health.Watch` in `reconcile`, after the `restartAllowed` guard so
+  a completed one-shot is not probed.
+- **incus**: no startup pass exists, so `ensureHealthRearmed` is driven lazily from
+  `Status` and `List`. That is enough to arm itself — `service_healthy` converges by
+  POLLING status, so the first poll starts the probes it is waiting on.
+
+### The incus guard that a test, not a review, found
+
+Because incus's re-arm is triggered by a READ, it can run after an `Apply` in the
+same process. `Watch` restarts the loop from `starting`, so the pass would have
+discarded a healthy verdict this server had already earned — and discarded it on
+the very call a compose dependency uses to observe it. The guard is
+`b.health.State(name) != ""` (a watched instance always has a state), which makes
+the pass idempotent with respect to the live watch set rather than merely
+once-per-process.
+
+### Neutralization
+
+Four fixes, four neutralizations, each producing the diagnostic it was written for:
+
+| broken | test that failed | diagnostic |
+| --- | --- | --- |
+| `rearmHealth` call removed | containerd `TestServerRestartRearmsProbing` | `health … = "", want "starting"` |
+| `health.Watch` removed from bare reconcile | `TestStartupReconcileRearmsProbing` | same |
+| `ensureHealthRearmed` calls removed | incus `TestServerRestartRearmsProbing` | same |
+| already-watched guard removed | incus `TestRearmDoesNotResetALiveVerdict` | `= "starting", want "healthy"` |
+
+Each re-arm test asserts BOTH halves. Arming the running instance is the claim; the
+stopped instance reading `""` is what makes the claim mean something — a pass that
+armed everything would satisfy the first assertion and report a stopped workload as
+unhealthy, which is precisely what `Stop`'s unwatch exists to avoid. incus adds a
+companion instance for the same reason.
+
+`TestRearmDoesNotResetALiveVerdict` reaches `healthy` by running a REAL probe on a
+1ms interval rather than by exposing a state-setter for tests. A test hook into the
+engine would have let the test pass without the loop ever having produced a verdict.
+
+### Docs
+
+`docs/reference/deploy-backends.md` gains a cross-backend `## Healthchecks` section
+(three routes: daemon-delegated on dockerhost/podman, Probe-translated on
+kubernetes, cornus-run on the other three), Docker's state machine and defaults
+verbatim, the two things cornus's engine does that the delegating backends do not
+(`start_interval`; one probe in flight per instance), and the restart paragraph the
+defect above made true.
+
+Four sentences elsewhere in the tree said the opposite of the code and are now
+corrected: containerd's and bare's "known gaps", incus's gap list, and
+`deploy-spec.md`'s `::: warning containerd` block — which became a `kubernetes`
+warning, since `startInterval` is now the only healthcheck field any backend
+cannot express. `guides/deploying-workloads.md` had the same stale claim twice.
+
+Two pieces of pre-existing drift were corrected in the ja/zh pages while I was in
+the same sentence: both said "four host backends" and omitted `podman`, and the
+incus guide entry claimed no mounts, volumes, or entrypoint override, all three of
+which incus has mapped for some time.
+
+### Verification
+
+- Go gate clean: `gofmt`, `go build ./...`, `go vet ./...`; `./pkg/deploy/...`
+  `./pkg/server/...` `./pkg/compose/...` pass, and `./pkg/deploy/...` passes under
+  `-race`.
+- `make e2e-check` passes.
+- `npm run docs:check` fully clean: 534 fragment links, 0 dead (the new
+  `#healthchecks` / `#ヘルスチェック` / `#健康检查` anchors resolve in all three
+  locales); freshness records 68 pages x 2 locales, all current.
+- Structural translation audit passes for all six pages. One review WARNING remains
+  on line 51 of the ja/zh `deploy-backends.md` (one extra inline `` `incus` `` in an
+  untouched credentials paragraph) — pre-existing, and a repetition where English
+  used a pronoun rather than a factual difference.
+- `go test ./...` has one failure OUTSIDE this work: `pkg/wire`'s
+  `TestTmpRTTCount`, in an untracked scratch file (`zz_tmp_rtt_test.go`) another
+  agent is actively working on alongside its modified `pkg/wire/qosab/link.go`.
+  Untouched by this change and left alone.
+
+### What I would flag
+
+The incus leg still has never run end to end. Both scenarios pass individually and
+registration is structurally identical to the other two, but that is an argument,
+not a measurement — and this entry exists because an argument of exactly that shape
+("the check is persisted, so health comes back") turned out to be false.
+
+## 2026-08-08 — Closing the block-protocol gap against raw 9P, and the phantom that nearly cost a day
+
+Asked for: find why the block protocol is notably slower than bare 9P in the
+no-cache scenario, and close the gap. It was four independent costs, none of them
+the data path everyone would look at first, plus a correctness bug that the fix
+for one of them removed.
+
+On the real docker host-mount path the ratios moved from `0.85x / 0.88x / 1.20x`
+(write / read / fsync) to `1.15x / 0.95x / 1.17x faster` — the block protocol now
+writes and fsyncs FASTER than the splice it was losing to, and reads at parity.
+
+### The four causes, in the order they cost the most
+
+**1. A walk cost three round trips instead of one.** `writableConfinedFile` embeds
+`p9.DefaultWalkGetAttr`, which returns ENOSYS. The proxy forwarded that verdict to
+the p9 server in front of it, and p9's `walkOne` responds to ENOSYS by falling back
+to `Walk` + `GetAttr` — each of which is another crossing of the server<->caller
+link. So one `Twalk` became `opWalkGetAttr` (ENOSYS), `opWalk`, `opGetAttr`.
+
+The raw 9P splice never pays this, and that asymmetry is the whole point: there the
+identical fallback runs at the CALLER, against a local filesystem, with no hop at
+all. `walkGetAttrLocal` now resolves ENOSYS on the authoritative side.
+
+**2. Opening a file cost two.** `blockProxyFile.Open` issued a `GetAttr` after
+`opOpen` to key and validate the cache entry — unconditionally, including in
+no-cache mode where the entire result is discarded.
+
+**3. Every write made the caller read a megabyte back off disk.** Classic coherence
+hashes the whole 1 MiB block a write touches. The kernel writes at msize
+granularity, which is a few hundred bytes SHORT of the block, so every write after
+the first straddles a boundary and `unitHashCovering` could not hash from the write
+buffer — it read the block back. In no-cache mode that hash is computed, sent, and
+thrown away.
+
+Fixed by `FeatNoCache`, a HELLO bit the caller advertises unconditionally as a
+capability and the proxy advertises only when it truly holds no cache. It is
+deliberately absent from `blockSupportedFeatures` and unparseable from
+`CORNUS_BLOCK_COHERENCE`: an operator who could set it on a cached mount would
+silently stop that cache ever being validated. A test pins both.
+
+**4. Roughly 3x write amplification in the framing layer.** A 1 MiB write was
+appended into a request payload (allocate + copy a megabyte to put 20 bytes in
+front of it), then allocated and copied again into a fresh frame payload at the
+caller; reads paid the same twice in the other direction. Now the header and the
+small metadata go out in one staged buffer with the bulk written straight from the
+caller's slice (`writeFrameParts`), read replies land directly in the p9 server's
+buffer (`doInto`), and large inbound request bodies come from a pool. In the
+CPU-bound in-process A/B that took a 16 MiB write from 62 MB to 22 MB allocated and
+a read from 45 MB to 8.5 MB.
+
+`rawReadAt` also stopped clamping reads to the end of the covering block, which had
+turned every boundary crossing into a short read plus a second request — block
+alignment is a CACHE requirement and this path has no cache.
+
+### The bug the third fix removed, and its other half
+
+A partial-block write to a file opened O_WRONLY failed **EBADF**, because hashing a
+straddling write reads the block back through the same write-only descriptor. That
+is an ordinary append — `dd`, a shell `>` redirect — and it needed two writes to
+show, since the first covers the whole valid block and needs no read-back. It is
+why the in-process A/B could not even run its write leg at first.
+
+`FeatNoCache` fixes it for no-cache mounts by not reading at all. The CACHED
+`:async` path was still broken, and there the read-back is genuinely needed, so the
+caller now opens a read-only clone of its own handle on demand (`bsHandle.readAt`).
+Both halves are pinned by tests, and both neutralize correctly.
+
+### The phantom
+
+The first E2E run after the fix reported the block mount reading at **0.21x** of raw
+9P — a 4x regression on the one metric I had touched most. Three things stopped that
+becoming a day of work on a non-problem:
+
+- the in-process A/B said reads had IMPROVED, not regressed;
+- a new real-kernel-mount benchmark, run under a privileged container, put the same
+  build at parity on every combination of protocol, cache mode, and mux;
+- the next run of the very same E2E scenario said `1.05x`.
+
+The scenario took ONE sample per metric. Its samples are now logged individually
+and each metric is the best of three, and the logs from the confirming run show
+exactly why: within one run, `raw9p seq-read` sampled 0.42 / 0.17 / 0.17 s and
+`block seq-read` sampled 0.19 / 0.42 / 0.18 s. The same ~0.42 s hiccup lands on
+either side, so a single sample is one hiccup away from arguing for a change to
+code that is not wrong.
+
+The generalizable part is not "benchmarks are noisy". It is that a measurement that
+contradicts two independent instruments is a claim about the INSTRUMENT until a
+second run says otherwise.
+
+### Instruments added
+
+- `pkg/wire/mountmodes_bench_test.go` — the in-process A/B, both modes wired with
+  the same two hops, over a matrix of link profiles (`local`, LAN, WAN) using the
+  `qosab` link simulator (`NewLink` exported for it). Two axes because they fail
+  differently: on a local socket round trips are free and CPU/allocation shows; on a
+  link the round-trip COUNT dominates. A change that helps one and hurts the other
+  is not a fix.
+- `pkg/wire/mountkernel_linux_test.go` — the same comparison against a REAL kernel
+  9p mount, gated on `CORNUS_MOUNT_BENCH=1` + CAP_SYS_ADMIN. It runs as `go test -c`
+  plus one privileged container, where the E2E benchmark needs the whole runner
+  image, and it varies protocol x cache-mode x mux separately so a difference is
+  attributable to one of them. Reading back the file just written measured the page
+  cache under `cache=mmap` and the wire under `cache=none`; it now reads a file
+  written on the export side.
+
+### Verification
+
+Go gate green (`gofmt`, build, vet, `go test ./...`). `make e2e-check` parses every
+scenario. `async-write-docker` and `filecache-9p` pass on docker, so the cached path
+— which shares the new framing — is unaffected. Five E2E benchmark runs plus the
+best-of-three run agree on the direction.
+
+Neutralizations, all confirmed to fail with the intended diagnostic: the extra
+GetAttr (`open cost 2 round trips`), the WalkGetAttr fallback (`walk cost 3`), the
+read clamp (`2 READRANGE round trips`), the `FeatNoCache` negotiation (`second write
+... bad file descriptor`), the read-only clone (same), and a stray byte in the frame
+header. Two did NOT fail on the first attempt and both were test defects rather than
+code defects: the framing test compared `writeFrameParts` against `writeFrame`,
+which now delegates to it — the function checked against itself, exactly the failure
+mode `CLAUDE.md` warns about — and it now spells the wire layout out. The other was
+a partial neutralization of my own.
+
+### Left
+
+`go test -race ./pkg/blockcache/` fails
+`TestDiskStoreRMWDoesNotAllocateAChunkPerWrite` — pre-existing and race-only (that
+package is untouched here; race instrumentation inflates the per-op allocation the
+test puts a ceiling on). Filed.
+
+And the decision the previous entry closed is now open again on better terms: the
+12-15% cost that argued against making the block protocol the default for
+client-local mounts is gone. Filed, not acted on — it is the user's call.
+
+### Inventory: what changed, and where
+
+| surface | file | what it does |
+| --- | --- | --- |
+| `FeatNoCache` | `pkg/wire/blockproto.go` | HELLO bit: the proxy holds no cache, so skip all coherence hashing. Advertised as a CAPABILITY by the caller and as a REQUEST by a cacheless proxy; absent from `blockSupportedFeatures` and unparseable from `CORNUS_BLOCK_COHERENCE` on purpose |
+| `writeFrameParts` | `pkg/wire/blockproto.go` | one frame from a small metadata prefix plus an uncopied bulk body; small frames now leave in a single Write |
+| `readFrameHeader` + `doInto` | `pkg/wire/blockproto.go` | route a reply BEFORE reading its payload, so a read's bytes land straight in the p9 server's buffer. `claimed`/`readDone` keep an abandoning caller from releasing a buffer the reader still holds |
+| `doParts` | `pkg/wire/blockproto.go`, `blockproxy.go` | a write's data rides as the frame's bulk part instead of being appended into the request |
+| `Open` early return | `pkg/wire/blockproxy.go` | no-cache mode stops issuing a per-open `GetAttr` whose result it discards |
+| `rawReadAt` unclamped | `pkg/wire/blockproxy.go` | a read crossing a block boundary is one request, not a short read plus a second |
+| `walkGetAttrLocal` | `pkg/wire/blockserver.go` | resolve `WalkGetAttr`'s ENOSYS at the CALLER, where the fallback is two local calls, instead of letting the p9 server resolve it across the link |
+| `bsHandle.readAt` | `pkg/wire/blockserver.go` | coherence read-back through a lazily opened read-only clone, so an O_WRONLY handle no longer fails a partial-block write with EBADF |
+| `readRequest` + `reqScratch` | `pkg/wire/blockserver.go` | large inbound request bodies (writes) come from a pool with an explicit release |
+| `replyParts` | `pkg/wire/blockserver.go` | read replies write their data straight from the scratch buffer it was read into |
+| `qosab.NewLink` | `pkg/wire/qosab/link.go` | the link simulator, exported so a harness outside that package can drive a protocol over its profiles |
+| best-of-3 sampling | `e2e/benchmarks/bench-mount-modes.star` | every sample logged, each metric the best of three — see "the phantom" above |
+
+### The numbers, in one place
+
+Real docker host-mount path (`bench-mount-modes.star`, best of three per metric):
+
+| metric | before | after |
+| --- | --- | --- |
+| sequential write | 0.85x | **1.15x** |
+| sequential read | 0.88x | **0.95x** |
+| fsync latency | 1.20x slower | **1.17x faster** |
+
+In-process matrix (`BenchmarkMount`, mean of 3 runs), as block relative to raw 9P:
+
+| profile | metric | before | after |
+| --- | --- | --- | --- |
+| local | seq-write | 0.59x | 0.81x |
+| local | seq-read | 0.36x | 0.75x |
+| local | small-sync | 1.25x | 1.11x |
+| LAN | seq-write | 2.39x faster | 2.54x faster |
+| LAN | small-sync | 1.48x | 1.03x |
+| WAN | small-sync | 1.58x | 1.01x |
+
+Read the two tables together rather than either alone. `local` is a socket pair with
+no delay, so it measures CPU and allocation with round trips nearly free — it is
+deliberately harsher than any real mount, which is why it still shows a gap where
+the real mount shows none. The WAN and LAN `small-sync` rows are where the
+round-trip fixes show, because there a round trip costs 40 ms and nothing else
+matters. Neither profile alone would have found all four causes.
+
+Round trips per open-write-fsync-close cycle went 8 -> 5, which is exactly what
+raw 9P spends. Allocation for a 16 MiB transfer went 62 MB -> 22 MB (write) and
+45 MB -> 8.5 MB (read).
+
+### Re-verifying any of this
+
+```
+# the regression tests: round-trip budget, no-cache negotiation, write-only
+# partial writes in both modes, frame layout
+go test ./pkg/wire/ -run 'TestNoCache|TestWriteOnly|TestWriteFrameParts' -v
+
+# the in-process A/B across link profiles (not part of the gate)
+go test ./pkg/wire/ -run XXX -bench BenchmarkMount -benchtime 5x -count 3
+
+# the same comparison against a REAL kernel 9p mount, without the runner image
+go test -c -o ./.agents-workspace/tmp/wire.test ./pkg/wire/
+docker run --rm --privileged -v "$PWD/.agents-workspace/tmp":/w -e CORNUS_MOUNT_BENCH=1 \
+  debian:trixie-slim /w/wire.test -test.run TestKernelMountModes -test.v
+
+# the production measurement (needs the privileged runner)
+make e2e-container E2E_TARGETS=docker \
+  E2E_SCENARIOS=e2e/benchmarks/bench-mount-modes.star CORNUS_E2E_BENCH=1
+
+# the CACHED path, which shares the new framing and must not regress
+make e2e-container E2E_TARGETS=docker \
+  E2E_SCENARIOS="e2e/scenarios/async-write-docker.star e2e/scenarios/filecache-9p.star"
+```
+
+The kernel-mount benchmark is the one to reach for first when something here looks
+wrong: it is `go test -c` plus one container, it varies protocol x cache-mode x mux
+separately, and it is what disproved the 0.21x phantom while the E2E was still
+being re-run.
+
+## E2E coverage for the health re-arm, and what the neutralization cost to get (2026-08-08)
+
+Follow-up to the Phase 6 entry above. Two things landed: the incus leg ran end to
+end for the first time, and `deploy-server-restart.star` now covers the
+server-restart re-arm that the same day's defect fix introduced.
+
+### The incus leg
+
+All 14 scenarios passed under `E2E_STRICT=1`, so the preflight
+(`✓ incus — incus daemon reachable; skopeo + umoci on PATH`) was a real gate rather
+than a self-skip. The two that mattered:
+
+```
+• web  waiting for db (service_healthy)
+• ✓ up gated web on db reaching service_healthy
+• ✓ healthy after up
+• health after stop: 
+• ✓ healthy again after stop/start: the restart re-armed the probe
+```
+
+The `waiting for db` line is what makes the first one evidence: the gate BLOCKED
+rather than skipping the condition. The empty `health after stop:` is what makes
+the second one evidence: it separates "re-armed" from "never disarmed".
+
+Two scenario-internal self-skips are visible in the log and both are documented
+backend properties, not silent gaps: `logs_tail` content is not asserted (incus
+console logs carry no app stdout), and credential FILE delivery is declined by name
+(incus records an instance's id map on the instance, which does not exist yet when
+the file must be written). `env` and `endpoint` both ran.
+
+### The gap the leg did not close
+
+`health-restart-rearm.star` restarts the DEPLOYMENT (`Stop` unwatches, `Start`
+calls `syncHealth`) — machinery that predates the defect. The defect was a SERVER
+restart, a different path entirely. So the fix that was the whole point of the
+morning still had no end-to-end coverage after a fully green leg. Worth noting how
+that reads: 14/14 passing looked like the work was covered.
+
+`deploy-server-restart.star` was the right home — it already does a real
+`stop_server()` + `serve()` against the same data dir. It gained a healthcheck on
+its existing workload and two assertions, and was added to the containerd and incus
+subsets (Makefile + `entrypoint.sh`; `TestScenarioSubsetsInSync` enforces the pair).
+It had been in the docker/kube full set and bare only, so containerd's re-arm had
+no coverage either.
+
+`deploy()` gained a `healthcheck=` kwarg: a list is the CMD-form command, a dict
+adds timings. The dict matters — at the 30s default interval the scenario would
+spend its entire budget waiting for the first probe.
+
+### Two design choices worth recording
+
+**The health assertions are gated to containerd/bare/incus**, and NOT because the
+other targets were unverified. On dockerhost/podman and kubernetes the daemon owns
+the probe and outlives cornus, so health surviving a cornus restart says nothing
+about cornus — the assertion would pass there no matter how broken the re-arm was.
+A check that cannot fail is worse than no check, so it is scoped to the backends
+where the behavior actually lives. The docker AND kube legs were still run, to
+confirm the `probes == False` path (`healthcheck = None`) is a clean no-op. Their
+logs contain NO health line at all, which is the point: the block did not merely
+pass there, it did not run. A miswired gate would have evaluated true and then
+succeeded anyway for the daemon-owned reason, and no amount of reading the source
+distinguishes those two.
+
+The kube run also settles a question left open earlier: `stop_server()` + `serve()`
+does work against a server/in-cluster-only backend. All four original steps passed
+there, including the `kill 1` supervision reattach.
+
+**The baseline assertion is load-bearing.** Without "healthy BEFORE the restart", a
+healthy reading afterwards is indistinguishable from a probe that never ran.
+
+### Verification
+
+| leg | baseline | re-arm | original 4 steps |
+| --- | --- | --- | --- |
+| incus | ✓ | ✓ | ✓ (first run ever) |
+| containerd | ✓ | ✓ | ✓ (first run ever) |
+| bare | ✓ | ✓ | ✓ (still green) |
+| docker | n/a (skipped) | n/a | ✓ |
+| kube | n/a (skipped) | n/a | ✓ |
+| incus, NEUTRALIZED | ✓ | **✗ as intended** | — |
+| containerd, NEUTRALIZED | ✓ | **✗ as intended** | — |
+| bare, NEUTRALIZED | ✓ | **✗ as intended** | — |
+
+The neutralized run is what the other rows rest on. With `ensureHealthRearmed`
+removed from incus's read paths:
+
+```
+scenario failed: health did not come back after the server restart; got  — the
+probe was not re-armed, and the healthcheck was not recovered from where the
+deploy persisted it
+```
+
+The empty `got ` is the original defect's exact symptom: not `unhealthy`, not
+stale — NOTHING, because the server had stopped looking. And `✓ healthy before the
+restart` still passed in that same run, which is what proves the failure is the
+re-arm specifically rather than a broken probe.
+
+The bare leg is called out separately because it was green before this change: a
+failure there would have been a regression introduced, not a defect found.
+
+**All three backends were neutralized, not just incus.** The first pass did incus
+only and the containerd/bare rows rested on "identical structure" — the same
+inference that was wrong earlier the same day, so it was worth the two extra runs.
+Removing `rearmHealth` from containerd's reconcile and the `health.Watch` from
+bare's produced the identical diagnostic on both:
+
+```
+health did not come back after the server restart; got  — the probe was not
+re-armed, and the healthcheck was not recovered from where the deploy persisted it
+```
+
+The neutralization was scoped to the RECONCILE re-arm alone — `syncHealth`, which
+Apply and Start use, was left intact on both — and `✓ healthy before the restart`
+passed in every neutralized run. That is what isolates the failure to the re-arm
+rather than to a probe that never worked. A neutralization that also broke the
+baseline would have failed the scenario while proving nothing about which line
+mattered.
+
+Both backends' UNIT tests fired on the same edit before the E2E ran, which
+confirms the two layers are wired to the same lines rather than to two different
+notions of "re-arm".
+
+Go gate clean (`gofmt`, build, vet, `./pkg/e2e/` + `./pkg/deploy/...`);
+`make e2e-check` passes.
+
+### Method note
+
+The morning's defect was found by checking a documentation sentence against the
+code. This one — that a green 14/14 leg still left the fix uncovered — was found by
+asking which code path a passing scenario actually exercises. Both are the same
+question in different clothes: what would this evidence look like if the claim were
+false?
+
+## 2026-08-08 — Instrumenting the mount benchmark for syscalls, copies and allocations
+
+Asked for, ahead of optimizing blits and allocations: make the benchmark able to
+measure real cost, not just wall time. Three quantities now sit beside ns/op, and
+each of them already changed what the next step should be.
+
+### What is counted, and where the counter sits
+
+| metric | what it is | where |
+| --- | --- | --- |
+| `sys/op` | socket Read+Write calls across BOTH hops — real syscalls | `syscallConn` around the LOWEST conn of each hop (under yamux, not the stream) |
+| `wireB/op` | bytes the server<->caller hop carried | same wrapper |
+| `fsys/op`, `fileB/op` | ReadAt/WriteAt against the authoritative export — real pread/pwrite | `countingAttacher` injected through the new `serveBlockServerFS` seam |
+| `blit-*B/op` | bytes copied, by category | wrappers at the copy sites, `-tags blitprof` |
+
+Copy accounting is a BUILD TAG, not an always-on counter, because the path being
+measured runs up to 16 concurrent handlers per side: a global atomic per copy
+would contend on one cache line and distort the number it exists to produce.
+Without the tag every wrapper inlines back to the builtin it wraps.
+
+### The wrapper shape earned itself immediately
+
+The counting started as `blit(kind, n)` calls placed after each copy. Moving the
+accounting INSIDE wrappers — `blitCopy`, `blitAppend`, `blitAppendString`,
+`blitReadFull` — was asked for, and converting to it exposed two sites the
+by-hand version had simply missed: both `io.ReadFull`s on the caller's request
+path. The write leg had been reporting **960 B** of copies for a 16 MiB write; the
+true figure is **16.78 MB**, the payload landing at the caller. A number that
+wrong, in the direction of "nothing to fix here", is exactly what would have sent
+the optimization work at the wrong thing.
+
+The lesson is the one the wrapper encodes: a copy and its tally cannot drift apart
+if there is no way to write one without the other.
+
+### The instrument is itself under test
+
+`TestBlitAccountingCountsWhatItClaims` (requires the tag) drives a known 4 MiB
+each way and asserts one landing per direction, with everything else in the noise.
+It doubles as the zero-copy regression guard. Neutralized three ways, each failing
+with its own diagnostic: removing direct read delivery (`user-copy = 4194304`),
+staging the write payload into a message again (`msg-append = 4194304`), and a
+counter that silently stops counting (`wire-read = 0`).
+
+`TestCountingFileForwards` guards the file counter, because `countingFile` embeds
+both `p9.File` and `NoopFile` — a shape where a missed override silently becomes a
+no-op and the benchmark would report zero file ops and look like a win.
+
+And the obvious objection to a conn wrapper — that hiding the concrete type costs
+io.Copy a fast path and biases the raw 9P side — is measured, not argued: 949 vs
+952 MB/s write, 2223 vs 2173 MB/s read, wrapped vs unwrapped. `*net.UnixConn`
+cannot satisfy `io.ReaderFrom` (its `ReadFrom` is the packet-oriented one), so
+there is no fast path to lose. That changes if the harness ever moves to TCP.
+
+### What the numbers now say to optimize
+
+16 MiB sequential, `local` profile:
+
+| | raw 9P | block |
+| --- | --- | --- |
+| syscalls (write) | 1180 | **347** |
+| syscalls (read) | 1167 | **323** |
+| wire bytes | 16.78 MB | 16.78 MB |
+| file ops | 32 | 32 |
+| allocated (write) | 16.9 MB | **22.5 MB** |
+| allocated (read) | 4.9 MB | **8.5 MB** |
+
+The block protocol already uses **3.4x fewer syscalls**, moves the same bytes, and
+touches the file the same number of times — while still being slower on wall time.
+So the remaining gap is neither syscalls nor I/O amplification. It is allocation,
+and `-tags blitprof` says it is not copies either: the data path is at exactly one
+landing per direction (`user-copy` and `msg-append` are zero; `frame-stage` is
+~11 KB per 16 MiB).
+
+An allocation profile of the block write leg attributes it:
+
+- **69% `p9.recv`** — the p9 server's per-Twrite buffer, in the library, on the
+  proxy side. The raw path pays the same thing at its own p9 server, which is why
+  both baselines sit near 1x of the payload.
+- **20% the `reqScratch` pool** — 4.7 MB per 16 MiB iteration. A `sync.Pool` that
+  GC drains between iterations while the p9 allocation above drives collection.
+  Ours, bounded (`writeSem` caps concurrent writers at 16), and therefore
+  replaceable with a fixed freelist that GC cannot empty.
+
+That second one is the aim point: a bounded, self-owned pool being emptied by a
+collector that the first one keeps triggering.
+
+The one place the block protocol still spends MORE syscalls is `small-sync`:
+33/op against raw 9P's 20. Per-op framing, and visible only because the counter
+exists.
+
+### Verification
+
+Go gate green under both `go build ./...` and `-tags blitprof`; `go vet` clean for
+both; `go test ./...` and `go test -tags blitprof ./pkg/wire/` pass. The full
+matrix runs with the counters attached on every profile.
+
+Also added while the counter was fresh: `TestNoCacheWriteCausesNoFileReads`
+asserts that writing 4 MiB in no-cache mode causes ZERO file reads at the export.
+It pins the coherence read-back removal in the form that matters — bytes touched,
+not wall time, which is what hid the cost in the first place on a warm page cache.
+Neutralizing the `FeatNoCache` negotiation fails it with
+`read 4194304 bytes back off the file in 4 reads`.
+
+## 2026-08-08 — Session summary: one docs task, one defect, and what it took to believe the fix
+
+Consolidates three earlier entries from this session ("A health-probe engine ...
+phases 1-5", "Phase 6: documenting the health engine ...", and "E2E coverage for
+the health re-arm ..."). Read those for the detail; this records the through-line
+and the findings that outlive the task.
+
+### The arc
+
+The assignment was Phase 6 of an approved plan: document the health engine in three
+locales. It became five distinct pieces of work, each one uncovered by finishing the
+previous one honestly:
+
+1. **Docs.** A cross-backend `## Healthchecks` section, plus four sentences
+   elsewhere in the tree that stated the opposite of the code.
+2. **A defect.** Drafting "probing resumes for instances that are still running"
+   meant checking it. It was false: the healthcheck was persisted by design, and
+   nothing ever read it back. A cornus restart left every running workload
+   reporting no health until someone redeployed it.
+3. **The fix**, per backend — `rearmHealth` in containerd's reconcile, a
+   `health.Watch` in bare's, a lazy `ensureHealthRearmed` on incus's read paths.
+4. **A coverage gap.** The incus leg then went 14/14 green — and the fix still had
+   no end-to-end coverage, because `health-restart-rearm.star` restarts the
+   DEPLOYMENT, not the SERVER.
+5. **The coverage**, and then its neutralization on all three probing backends.
+
+### Findings worth keeping
+
+**Writing documentation is a verification pass.** Prose forces a claim into the
+open where it can be checked; the code comments had asserted the same thing for
+weeks in a form vague enough to survive review. The defect was found by a sentence,
+not by a test.
+
+**Green does not mean covered.** A 14/14 leg read as "this work is verified" while
+the day's central fix was untested. The question that catches this is not "did the
+tests pass" but "which code path does a passing test actually execute" — and for
+`health-restart-rearm.star` the answer was `Stop`/`Start`, machinery that predated
+the defect entirely.
+
+**A neutralization must be scoped, or it proves nothing about which line matters.**
+Every neutralized run here kept `syncHealth` intact so the BASELINE still passed.
+Red for the wrong reason is the exact mirror of green for the wrong reason, and a
+neutralization that breaks everything demonstrates only that the test can fail.
+
+**"Identical structure" is not a measurement.** The containerd and bare rows first
+rested on being structurally the same as incus. That is the shape of inference that
+produced the defect in step 2 — the persistence was built correctly, so the reading
+back "must" have been there. Two extra runs settled it.
+
+**A check that cannot fail is worse than none.** The health assertions are gated to
+the backends running cornus's own engine. On dockerhost and kubernetes the daemon
+owns the probe and outlives cornus, so the assertion would pass there however
+broken the re-arm was. Confirmed by absence: the docker and kube logs contain no
+health line at all.
+
+### Process notes against myself
+
+- I reported a failed E2E run as exit 0. The command ended in `echo "EXIT=$?"`, so
+  the harness saw the echo's status. Do not append anything after the command whose
+  exit code is the result.
+- I edited an existing JOURNAL entry in place twice (adding the kube row, then the
+  neutralization section) rather than appending. CLAUDE.md forbids this. The content
+  is correct but the method was not; corrections belong in a new entry.
+
+### State at hand-off
+
+Go gate clean (gofmt, build, vet, `./pkg/deploy/...`, `./pkg/e2e/`); `make
+e2e-check` passes; `npm run docs:check` fully clean with translation freshness
+recorded for all six pages. No commits made.
+
+One pre-existing failure is unrelated and untouched: `pkg/wire`'s `TestTmpRTTCount`,
+in another agent's untracked scratch file. The working tree also carries that
+agent's `pkg/wire` changes.
+
+Open, and filed in TODO.md: FSOperator on incus, and incus credential `file`
+delivery (blocked on an ordering problem — incus records an instance's id map on the
+instance, which does not exist when the credential file must be written).
+
+## 2026-08-08 — Measuring the incus credential-`file` remedy before building it, and correcting it
+
+Starting on the known incus gaps. This entry is measurement only — no production
+code changed yet. It exists because the remedy TODO.md recorded turned out to be
+imprecise in a way that would have sent the implementation looking for a
+replacement it did not need.
+
+### The observation still holds
+
+`BindsCredentialDir` returns false (`incushost/credential_endpoint_linux.go:110`),
+so `file` deliveries are refused on incus. The stated cause — the server writes the
+files and rewrites the spec BEFORE Apply, but incus records the id map on an
+instance that does not exist yet — is accurate.
+
+### The recorded remedy was wrong about WHICH KEY holds the map
+
+TODO.md said "create -> read the map -> write the files -> attach -> start". Probing
+a real incusd (`.agents-workspace/tmp/incus-idmap-probe*.sh`, run in the e2e image):
+
+- `volatile.idmap.current` is **absent** on a created-but-never-started instance.
+  Round 1 checked only that key and I wrote the verdict "the recorded remedy's
+  premise FAILS".
+- That was wrong, and the disproof was in my own printout: **`volatile.idmap.next`
+  IS present pre-start**, and its value is byte-identical to what `.current`
+  becomes after start. Confirmed on two independent instances (round 2, A).
+
+The same error shape this codebase keeps producing: probe one name, find nothing,
+generalize to "unavailable". Had I stopped at round 1 I would have declared a
+documented remedy dead and gone hunting for an alternative.
+
+### What is now measured
+
+| | result |
+| --- | --- |
+| `.next` pre-start predicts `.current` post-start | YES, exactly, on two instances |
+| both instances shared one map | yes on a default daemon — but `security.idmap.isolated=true` allocates per instance, so it must be read PER INSTANCE, never assumed |
+| attach a disk device to a stopped instance | works |
+| full ordering: create -> read `.next` -> chown host file into the range -> attach -> start -> read inside | **works** |
+| same, mounted under `/run` | **fails** — the OCI container tmpfs's over `/run` at start and hides the device |
+| `incus file push` into a NEVER-started instance | works |
+| push honours `--uid`/`--gid` for a non-root workload | yes — a 0600 file pushed as uid 1000 is readable by uid 1000 and refused to others |
+
+Round 1 also produced two INCONCLUSIVE verdicts I nearly recorded as negative: the
+device "not readable" was the `/run` tmpfs, not a broken mechanism, and the push
+test used an instance that had already been started once, which is not the deploy
+ordering. Round 2 isolated both, and B2 is a deliberate control that re-runs the
+failing `/run` path so the diagnosis is confirmed rather than assumed.
+
+### The `/run` constraint is the finding with the widest blast radius
+
+It is not specific to credentials. ANY disk device this backend attaches under
+`/run` is invisible inside an OCI application container. Worth checking against the
+existing mount and volume paths before something else lands there.
+
+### Two viable routes, and they are not equivalent
+
+Both now measured to work, so the choice is design, not feasibility:
+
+1. **Disk device** (create stopped -> read `.next` -> chown -> attach -> start).
+   Matches every other backend: the server writes, the backend binds a read-only
+   mount, one architecture. `readonly=true` is enforced by the device and the
+   credential never enters the rootfs. Cost: it interleaves server and backend work
+   — the server cannot chown until the backend has created the instance — so it
+   needs a new seam between them, plus the Apply restructure.
+2. **File push** (create -> push with `--uid` -> start). No host path, no id map, no
+   ordering problem, far less code. Cost: the credential is written INTO the
+   instance rootfs rather than mounted, so it is not read-only and its lifetime is
+   the instance's; and it does not fit `CredentialBinder`, whose whole meaning is
+   "the server writes a path this backend binds".
+
+Recorded rather than decided: the routes differ in the security properties of the
+delivered credential, which is the user's call, not mine.
+
+## 2026-08-08 — incus IDMap answered the identity for a not-yet-started instance
+
+First code change of the incus credential-`file` work, and it is a bug fix that
+stands on its own: it is wrong today, independently of the feature that exposed it.
+
+`IDMap` read `volatile.idmap.current` only, and `parseIncusIDMap` treats an absent
+value as the identity — a deliberate rule, for `security.privileged=true`
+instances that genuinely apply no user namespace. The rule is right; the input was
+incomplete. A created-but-never-started instance has no `.current`, so `IDMap`
+reported "this runtime does not remap" for an instance about to be remapped. Any
+file the server then owned for that workload would be owned as the server itself
+and unreadable inside — the exact failure `pkg/deploy/idmap.go` says it exists to
+prevent, and silent, since the deploy succeeds and the application fails later
+with its own permission error.
+
+Not a hypothetical state: it is precisely where a deploy sits between creating an
+instance and starting it, which is when credential-file ownership is decided. The
+disk-device ordering puts every incus deploy through it.
+
+Fix: prefer `.current`, fall back to `.next`. Both halves are load-bearing and each
+is pinned by a test that fails when it is broken:
+
+| neutralization | test that fired |
+| --- | --- |
+| drop the `.next` fallback (the original bug) | `TestIDMapReadsTheNotYetStartedInstance` — `HostUID(1000) = 1000, want 1001000` |
+| read `.next` FIRST (prediction over fact) | `TestIDMapPrefersTheAppliedMap` — `= 1001000, want 501000` |
+
+The precedence is not a formality: incus keeps `.next` populated after start, so
+reading it first would answer from a prediction where the applied map was
+available.
+
+**No `security.privileged` check is needed, and measuring is what established
+that.** A privileged instance carries `"[]"` in BOTH keys — an empty range set,
+which `parseIncusIDMap` already turns into an empty `IDMap`, which is already the
+identity. My probe's shell verdict said the opposite ("privileged DOES carry
+.next") because it tested string non-emptiness and `[]` is a non-empty string.
+Third time in this probing session that the verdict logic contradicted its own raw
+data; the dump is what settled it, plus an independent control that reads nothing
+from either key — on the host, `priv`'s rootfs is owned `0:0` and `unpriv`'s is
+owned `1000000:1000000`.
+
+Tests drive `IDMap` end to end through the fake conn, not `parseIncusIDMap`
+directly. That distinction is why the defect survived: the parser was always
+correct about the string it was handed, and the bug was in WHICH string it was
+handed. A parser-only test cannot see that, and there were three of them.
+
+Remaining for the feature: the Apply restructure (create stopped -> read the map ->
+chown -> attach the device -> start), the server/backend seam that lets the chown
+happen after create, the `/run` mount-target constraint, and flipping
+`BindsCredentialDir` to true.
+
+## 2026-08-08 — incus credential `file` delivery: the ordering restructure, landed
+
+Closes the gap measured earlier today. incus now delivers `file` credentials;
+`BindsCredentialDir` answers true. Verified on a live daemon, and on the four
+other targets the shared scenario runs on.
+
+### The shape
+
+Every other remapping runtime answers `IDMap` from something that outlives any one
+workload, so the server resolves ownership, writes the files, and Apply is an
+ordinary bind. incus records the map on the INSTANCE, so asking before Apply does
+not merely answer badly — it ERRORS (`instance cornus-web-0 not found`). That is
+the whole reason the feature was refused.
+
+`deploy.LateIDCredentialBinder` names it. The server writes with CONTAINER-side
+ids and hands the directories to the backend, which owns them in the one window
+where the map exists and nothing is reading it: after create, before start.
+
+The dirs are passed explicitly rather than marked on `api.Mount`, and that was the
+deciding constraint rather than a style choice. `api.Mount` is the USER-FACING
+spec; a "chown this source" field would let a deploy.yaml aim a server-performed
+chown at any path the bind policy allows. Passing directories the server itself
+created keeps that safe by construction.
+
+Apply now creates STOPPED and starts in a second pass, on one path rather than
+only when credentials are present. A branch would have made the ordering that
+carries credential delivery the one the E2E suite almost never runs.
+
+### Refused rather than delivered wrong
+
+`security.idmap.isolated=true` gives each replica a DIFFERENT range, and one host
+directory bind-mounted into all of them carries one ownership. Delivering replica
+0's anyway means the deploy succeeds, replica 0 works, and the rest fail later on
+their own permission error. It is refused by name at deploy time instead.
+
+### Three things this turned up that were not the feature
+
+**Nothing pinned `BindsCredentialDir() == false`.** Flipping a capability that had
+shaped this backend's credential behaviour for months broke no test. Now pinned,
+both the declaration and the interface behind it.
+
+**A self-skip had outlived its cause.** `credentials-env-host.star` skipped the
+file arm on incus for a reason that was no longer true. It is replaced with a
+`fail()`, not a deletion: if a target regresses it must say which and why. The
+skip's real cost was not the missing feature — it was that the non-root arm behind
+it had NEVER RUN on incus, so an assumption about exec had gone untested there.
+
+**That assumption was wrong, and the backend was innocent.** The arm asserted
+`id -u == 1000` through `cornus exec`, and incus answered 0. Measured before
+concluding anything: with `oci.uid=1000`, PID 1 runs at host uid 1001000 against a
+control of 1000000, and `ps` inside reports USER 1000 — so `oci.uid` IS applied and
+`incus exec` simply runs as root whatever the init uid is. The assertion was
+measuring the exec, not the workload.
+
+The fix makes the arm observe the claim it actually makes: the WORKLOAD records
+its own uid and its own read into /tmp/proof, and exec merely fetches the result,
+which it may do as anyone. That is stronger on every target — it no longer depends
+on exec inheriting the container's user. It also had to move `command` to
+`entrypoint`, because incus can only replace the whole argv and a command-only
+override is ignored there (the warning was in the failing run's own log).
+
+### Verification
+
+Unit: six neutralizations, all compiling, each failing with its intended
+diagnostic. Two are worth naming — owning the range BASE instead of the mapped uid
+(`[1000000] want [1001000]`; the base is container root, exactly as unreadable as
+leaving it owned by the server), and asking a late binder for host ids up front,
+which reproduces the original blocking error verbatim.
+
+Two process corrections on the way there: the first version of the two tests
+covering the feature called the real chown and SKIPPED unless root, so on an
+ordinary machine they never ran and the package still printed ok — the syscall is
+now injected so they observe the ids and paths, which is what can be wrong. And in
+the first neutralization pass one attempt was a build failure (not a valid
+neutralization) and another fired for the wrong reason, on an incidental
+`operation not permitted` that would have vanished when the suite runs as root.
+
+E2E, `credentials-env-host.star`, all five targets: incus, docker, containerd,
+bare, podman-rootless. incus is the new capability; podman-rootless is the
+cross-check that the pre-existing path still works, since it reaches the same
+guarantee through `deploy.IDMapper` and libpod rather than a per-instance map.
+
+### An unrelated defect found while verifying
+
+Running `E2E_TARGETS="docker containerd bare"` in ONE container fails on bare with
+`10.4.0.2 has been allocated to cornus-creds-env-0, duplicate allocation is not
+allowed`. containerd and bare share the host-local CNI IPAM store under
+/var/lib/cni and both deploy the same instance name, so the earlier leg's
+reservation collides with the later one. bare passes ALONE, which is what
+established the cause rather than assuming it.
+
+Not caused by this change and not specific to credentials: any multi-target run of
+a scenario whose deployment names collide can hit it. Filed in TODO.md, because to
+whoever meets it next it looks like an inexplicable flake.
+
+## 2026-08-08 — incus can serve FSOperator over SFTP, including rename (measurement)
+
+Second known incus gap: no `deploy.FSOperator`, so the web file explorer relays
+every byte instead of operating in place. Measurement only; no code yet.
+
+### The obvious design was the wrong one
+
+The backend already uses incus's instance FILE API for `cornus cp`, so the
+apparent move is to build FSOp on that. It cannot carry the feature: the file API
+has GET / POST / DELETE and no RENAME, and rename is close to the reason
+FSOperator exists ("no readdir, no delete, no rename, and no way to copy from one
+place to another without dragging every byte out to the caller and straight back
+in"). An FSOp built on it would answer FSErrUnsupported for the headline op.
+
+The Go client also exposes `GetInstanceFileSFTP`. Measured against a live daemon
+(`.agents-workspace/tmp/incusprobe/`, built against the repo's own incus client so
+it exercises exactly what the backend would call):
+
+| op | result |
+| --- | --- |
+| SFTP channel opens on an OCI APPLICATION CONTAINER | yes |
+| mkdir / create+write / stat / readdir / read / remove / rmdir | all ok |
+| **rename** | ok, and the target verified to exist afterwards |
+| `stat` of a missing path | `file does not exist`, `os.IsNotExist == true` |
+
+Run twice: once as a root instance, once with `oci.uid=1000`. Both identical. The
+non-root arm matters because the daemon serves this through its own forkfile
+helper rather than anything in the image, and an application container ships no
+sshd — "SFTP" here is not the guest's.
+
+`os.IsNotExist` being true is worth its own line: FSOp answers must map onto
+FSErr* codes, and a channel that reported errors only as strings would make
+FSErrNotFound a guess about wording.
+
+### What this settles
+
+Seven of the eight FSOps have a native SFTP primitive. Only `copy` has none; it
+can be read+write through the server, which still removes the round trip out to
+the CALLER (the gain FSOp is for) even though bytes cross cornus, or it can answer
+FSErrUnsupported and let the caller relay. That is a choice to make when writing
+it, and either is honest.
+
+Serving it over SFTP also satisfies the interface's explicit constraint: it is not
+splicing `ls`/`mv`/`rm` into the workload's image. A distroless image has no
+shell, and the daemon's channel needs none.
+
+### Note on method
+
+The file API was the natural thing to build on and would have produced a
+capability that could not rename. What avoided that was reading the client's
+method set before designing, rather than reasoning from what the backend already
+happened to use.
+
+## 2026-08-08 — Abstracting pkg/fsop, and the coverage that was not coverage
+
+Step one of putting `deploy.FSOperator` on incus. The measurement entry above
+settled that incus must reach files over the daemon's SFTP channel, and
+`pkg/fsop.Serve` was hard-wired to local paths (`fs.RootPath` + `os`), which is why
+the other three backends are 45 lines each. Rather than write a second
+op-serving implementation, the package now has an `FS` seam.
+
+### Where the seam is
+
+Everything that DECIDES an outcome stays in `pkg/fsop` and is shared: which root
+serves a path, the read-only refusal, the docker-cp naming a copy produces, the
+refusals to remove or overwrite a mount root, the listing truncation, and the
+FSErr* classification. Only the I/O varies. `Run`/`Serve` keep their signatures
+and delegate to `LocalFS`, so all four existing callers are untouched.
+
+Confinement deliberately belongs to the implementation, because it is not the same
+question twice: `LocalFS` resolves symlinks against the root so a container link
+cannot escape to the HOST, while a channel that can only ever see one instance is
+confined by the channel.
+
+### The finding that mattered more than the refactor
+
+The existing `pkg/fsop` suite passed unchanged, which looked like proof the
+refactor preserved behaviour. It was not. Coverage of the package's OWN tests is
+33.7%, and the rewired paths were largely untouched by them — `List`/`listDir`
+0%, `Unpack` 0%, `MkdirAll` 0%, `copyPath` 0%. Copy, the operation the package
+exists for, had no coverage in its own package at all.
+
+Across every consumer (caretaker, webbff, server, kubernetes) it is 81.6%, with
+each rewired path exercised. So the lines DO run. But three behaviours were then
+deleted one at a time and **not one test failed**:
+
+- `List` describing symlinks instead of following them,
+- `List` refusing a non-directory with `FSErrNotDir`,
+- `Remove` treating a missing path as success (documented as mattering, so a
+  retried delete does not report a failure for work already done).
+
+Statement coverage without assertions. The lines executed and nothing checked what
+they did — the package-scale version of a test that passes for the wrong reason,
+and precisely how a second implementation drifts from the first while every suite
+stays green. Which is the risk the abstraction was chosen to remove.
+
+### So the contract is the deliverable, not the interface
+
+`RunFSContract` asserts what any `FS` must do, and `sftpFS` will run the SAME
+assertions rather than a sympathetic rewrite of them — a contract asserted twice
+in two spellings is two contracts. All three previously-undetected neutralizations
+now fail, each naming its own rule; two earlier attempts at those neutralizations
+were build failures and were redone, since a compile error proves only that a
+symbol was named.
+
+Gate clean: gofmt, build, vet, full `go test ./...`, `make e2e-check`.
+
+### Remaining
+
+The SFTP `FS` implementation itself, run against `RunFSContract`, plus wiring
+`FSOp` into incushost and an E2E leg. The probe (previous entry) established every
+primitive it needs exists, including rename.
+
+## 2026-08-08 — FSOperator on incus, over the daemon's SFTP channel
+
+Second incus gap closed. `deploy.FSOperator` is implemented, so the web file
+explorer operates in place instead of relaying every byte, and a rename WITHIN a
+workload no longer drags the bytes out to the caller and back.
+
+### What landed
+
+`pkg/fsop.SFTPFS`, generic over any `*sftp.Client`, serving all eight ops. `copy`
+goes through the shared Pack -> Unpack path, so docker-cp naming is identical to
+`LocalFS` by construction rather than by agreement. `incushost.FSOp` opens the
+channel per request and serves ONE root, Target "/" over the instance's whole
+filesystem — unlike the caretaker's per-volume roots, which is why this needs no
+volume at all.
+
+Confinement is deliberately a different guarantee and is documented as one.
+`LocalFS` resolves symlinks against its root because the surrounding filesystem is
+the HOST and an escape hands out the machine; the SFTP channel addresses exactly
+one instance and the daemon holds that boundary. What `SFTPFS` still owes is that
+a request path cannot climb above the declared root by spelling, which is its own
+test.
+
+### The contract is what makes the seam worth having
+
+`TestSFTPFSContract` calls the SAME `RunFSContract` as `LocalFS`. Not a parallel
+set of assertions: a contract asserted twice in two spellings is two contracts,
+and the drift just moves into the tests where it is harder to see. It needs no
+daemon — `github.com/pkg/sftp` ships a server, so a real client speaks the real
+protocol over an in-memory pipe. Fixtures are built with `os` rather than through
+the client, so a bug cannot hide on both sides at once.
+
+Four neutralizations, all compiling, all caught: List following symlinks, Remove
+losing missing-is-success, List no longer refusing a non-directory, and `abs()`
+losing its path cleaning (a path escape). The last one I first recorded as NOT
+firing — my grep matched `^    --- FAIL`, and the confinement test is top level.
+The test was right and the check was wrong, which is the same class of mistake as
+a test that passes for the wrong reason, pointed at myself.
+
+### The web-fs failure was not mine, and isolating it mattered
+
+`web-fs.star` on incus dies at compose up:
+
+```
+Failed to setup device mount "cornus-vol-0": idmapping abilities are required
+but aren't supported on system
+```
+
+cornus creates managed volumes with `security.shifted: true` on purpose (replicas
+of one deployment need not map ids the same way), and a shifted volume requires
+IDMAPPED MOUNTS, which the containerized runner's kernel does not provide.
+
+Established by experiment rather than argument: restoring the atomic `Start: true`
+and re-running produced the IDENTICAL error, moved from start to create. So the
+create/start split only changed where it is reported — exactly what the comment
+written with that split predicted. No incus scenario had ever used a managed
+volume, which is why this had never surfaced.
+
+So `web-fs` can never reach its operator section on incus, and
+`deploy-fsop-incus.star` exists instead: same capability, no volume. Its rename
+assertion checks the new name exists, the OLD NAME IS GONE, and the bytes
+survived — a 200 alone would pass against an operator that reported success and
+did nothing. Live run: stat, list, rename, mkdir, recursive remove, all served
+over the channel.
+
+One stale claim corrected in `web-fs.star`'s header: "incus has no FSOperator and
+always relays".
+
+### Verification
+
+Unit: the FS contract against both implementations, four SFTPFS neutralizations,
+and the incus FSOp unsupported-path refusal. E2E: `deploy-fsop-incus.star` passes
+against a live daemon under `E2E_STRICT=1`. Gate clean — gofmt, build, vet, full
+`go test ./...`, `make e2e-check`.
+
+## 2026-08-08 — Documenting the two closed incus gaps
+
+Both capabilities landed today were documented as LIMITATIONS, in three locales.
+A doc that states the opposite of the code is worse than an undocumented feature —
+established earlier today by the sentence that turned out to be false and led to a
+real bug — so this is part of the work rather than a follow-up.
+
+Corrected in `docs/reference/deploy-backends.md` plus `ja` and `zh`:
+
+- The file-explorer paragraph listed the backends serving `deploy.FSOperator` and
+  omitted incus. It now names incus's different route (the daemon's SFTP channel,
+  which needs nothing in the image) and, in doing so, fixes a second inaccuracy: the
+  "needs root" caveat applied to the `/proc/<pid>/root` route specifically, not to
+  the capability, and reading it as the latter would suggest incus needs root for
+  this too.
+- The credentials paragraph said `file` on incus was REFUSED, with the timing
+  reason. It now describes both remapping routes — podman resolving the map before
+  the container exists, incus creating stopped and taking ownership once the map
+  does — and states the one case still refused (`security.idmap.isolated=true`,
+  where per-replica ranges cannot share one directory's single ownership).
+- The incus section's `cornus cp` bullet gained its sibling: structured operations
+  take the SFTP channel because the file API cannot express a rename at all.
+
+`npm run docs:check` fully clean: 534 fragment links 0 dead, freshness 68 pages x 2
+locales all current. The structural translation audit now reports ZERO warnings on
+this page — the pre-existing "extra `incus`" mismatch is gone, since the paragraph
+carrying it was rewritten.
+
+## 2026-08-08 — The failure half of the health state machine, and a differential against Docker
+
+Asked whether the E2E coverage was enough, the honest answer was no, and the
+biggest hole was nameable: **nothing anywhere in E2E ever observed `unhealthy`**.
+Every health scenario asserted the happy path — healthy after up, healthy after
+stop/start, healthy after a server restart. A backend that could only ever report
+`healthy` would have passed all of them.
+
+`health-unhealthy.star` closes it, and pins four things:
+
+1. `retries` consecutive failures flip to `unhealthy`;
+2. an unhealthy workload is STILL RUNNING — health reports, it does not act, and a
+   backend conflating the two shows up here (worth most on `bare`, where cornus IS
+   the supervisor);
+3. a later success restores `healthy`, which only happens if the failure counter
+   RESETS rather than latches;
+4. failures inside `start_period` do not count toward `retries` — the rule the
+   design notes called easiest to get wrong.
+
+### The start-period arm is built so neither outcome is a race
+
+`retries: 1` with a 1s interval means a workload failing inside its start period
+would be unhealthy in ~2s WITHOUT the rule, and cannot be unhealthy for 30s WITH
+it. Sampling at 8s sits ~28 seconds from either boundary. It then waits for the
+flip AFTER the period elapses, because "still starting at 8s" would otherwise also
+pass on a machine stuck in `starting` forever, reporting nothing at all.
+
+### Running it on Docker is the part that was actually missing
+
+The engine exists to match Docker's semantics, because that is what
+`depends_on: condition: service_healthy` is defined against. But every check of
+that until now compared cornus's engine to CORNUS'S READING of Docker's rules: the
+unit tests encode my interpretation, so a misreading produces green tests and a
+feature that is broken exactly where it matters, surfacing as a compose file that
+never converges.
+
+Docker runs its own healthcheck, so pointing the identical scenario at it turns
+that assertion into a measurement. All four arms held there — including the
+start-period rule — and then identically on containerd, bare and incus. That is
+the first evidence the interpretation itself is right, rather than merely
+self-consistent.
+
+incus is also where a failing probe had never been driven before: its exec returns
+a real return code where bare's OCI runtime reports only non-zero-as-error, and a
+failing probe is precisely where those paths differ.
+
+### Neutralized
+
+Deleting the start-period rule fails `TestFailuresDuringStartPeriodDoNotCount`
+("state reached \"unhealthy\", which this rule says it must not"); removing the
+flip to unhealthy fails four unit tests. Both compile.
+
+### Still open, stated rather than left implied
+
+- **`start_interval` has no test at ANY level** — not E2E, and not in
+  `healthengine_test.go` either. It is documented as the thing cornus's engine
+  does that kubernetes cannot, and the `::: warning kubernetes` block in the spec
+  reference rests on it. A documented differentiator resting on nothing; cheapest
+  to close with a unit test at millisecond durations.
+- FSOp `get` / `put` / `copy` are not exercised live on incus. The FS contract
+  round-trips pack/unpack against a real protocol over a pipe, so they are not
+  untested, but SFTP to a pipe-backed local server is not SFTP to incusd's forkfile
+  helper.
+- The `security.idmap.isolated=true` credential refusal is unit-only, and
+  credential-file REFRESH has never run on incus.
+
+## 2026-08-09 — Phase 0: making the mount benchmark measure the transport production actually uses
+
+First step of the agreed performance plan (`~/.claude/plans/tidy-growing-wreath.md`),
+and it was worth doing first: the instrument was measuring a stack nobody runs, and
+the layer it omitted turns out to dominate.
+
+### What was wrong with the instrument
+
+Three things, two of them defects in code I wrote last session.
+
+**The yamux roles were inverted.** `remoteHop` built `yamux.Client` for the
+cornus-server end and `yamux.Server` for the caller end. Production is the other
+way round — the cornus server ACCEPTS the WebSocket (`session.go` `accept()`), the
+deploy caller DIALS (`dial()`, via `pkg/deploywire/serve.go:30`). yamux barely
+cares; the roles differ in stream-ID parity. But it is the same asymmetry that
+decides which side masks its writes once a real WebSocket is underneath, so it had
+to be right before anything below could mean anything.
+
+**Only one end was counted.** `sys/op` covered the cornus-server end. Every cost
+and every future saving on the CALLER end — where `blockServer.readRequest` lives
+— was invisible. There is now a second counter reported as `csys/op`, on all
+profiles. `sys/op` keeps its old definition so the recorded figures (347 / 323 /
+33) stay comparable.
+
+**The transport was not production's.** The matrix ran yamux over bare sockets.
+Production runs yamux inside a WebSocket, and `coder/websocket` masks CLIENT
+writes in chunks bounded by its own 4 KiB `bufio`, flushing once per chunk
+(`write.go` `writeFramePayload`). The dialing side therefore pays roughly
+`ceil(bytes/4096)` write syscalls — and the dialing side is the caller, which
+serves the export, so the cost lands on READ replies.
+
+### The number
+
+A `ws-local` profile now stands up the real stack: `accept()`/`DialControlHeaderCT`
+over an in-process listener, production `yamuxConfig()`, syscall counters on the
+conns beneath the WebSocket.
+
+| 16 MiB seq-read, block | `local` | `ws-local` |
+| --- | --- | --- |
+| caller-side syscalls (`csys/op`) | 112 | **4274** |
+
+16 MiB / 4096 = 4096. The prediction written into the plan before the code existed
+was `csys ≈ payload/4096`; the measurement is 4274. Writes, which flow the other
+way and are unmasked, cost the caller 478.
+
+This is a 38x difference in caller-side syscalls that no existing instrument could
+see, and it applies to raw 9P equally (4322) — it is a transport cost, not a
+protocol one.
+
+### Why the topology has a test
+
+The one pre-existing in-process WebSocket harness
+(`TestBlockRTTOverWebsocketYamux`) serves the export from the WS SERVER side,
+whose writes are unmasked. That is precisely why this cost never surfaced
+in-process before, and it is a mistake that leaves everything green.
+
+So `TestWSHopPutsTheMaskingCostOnTheCallersWrites` asserts the RATIO between the
+directions at equal bytes — structural, where the absolute figures move with
+buffer sizes and Go versions. It logs `reads 1060, writes 8` for 4 MiB each way.
+Inverting the two returned ends flips it to `reads 8, writes 1060` and fails with
+the diagnostic naming the inversion. It carries a correctness control (the export
+must have served the bytes) because otherwise a harness where every op failed
+would move nothing, both counts would be ~0, and the ratio would be vacuous.
+
+### A plan step died on contact, before any code was written for it
+
+The approved plan's step 1.1 was "the WebSocket write buffer is not configurable,
+but it flushes into the HTTP transport's writer, and THAT is —
+`http.Transport.WriteBufferSize`, a few lines in `session.go`." That is wrong.
+After a 101 upgrade `net/http` returns `newReadWriteCloserBody(pc.br, pc.conn)`
+(`transport.go:2552`): the write half is the RAW conn, `pc.bw` is bypassed
+entirely, and `WriteBufferSize` never touches those writes.
+
+The cheap fix does not exist. What remains is forking `coder/websocket` (~15
+lines, ISC), switching to `gorilla/websocket` (already a dependency, has the knob,
+costs a ~120-line `net.Conn` adapter), or waiting for v1.9.0, which ships SIMD
+masking that is compiled but disabled behind a `TODO` in v1.8.15. All three are
+now gated on a CPU profile showing real time in `syscall.write` — the LTM already
+records that this path's system ceiling is TCP head-of-line blocking under loss,
+so on a real WAN link this may buy nothing.
+
+Recorded because the correction arrived AFTER approval, and the plan file now says
+so at the step rather than in a footnote.
+
+### Verification
+
+Go gate green (`gofmt`, build, vet, `go test ./...`) and green again under
+`-tags blitprof`. The matrix is 36 cells now (6 profiles x 3 workloads x 2 modes);
+`ws-*` rows should only ever be compared against other `ws-*` rows, since the
+WebSocket adds framing bytes and masking.
+
+### The gate on the WebSocket decision, answered
+
+The plan made all three WebSocket options conditional on a CPU profile showing
+real time in the write path, precisely so the fork would be taken on evidence
+rather than on the syscall count being alarming. The profile is in, and it both
+justifies the change and rules out the option I had been most hopeful about.
+
+`BenchmarkMount/ws-local/seq-read/block`, 20 iterations of 16 MiB, 830 ms of
+samples:
+
+| | share of total CPU |
+| --- | --- |
+| `websocket.(*Conn).writeFrame` (the whole masked write path) | 20.5% |
+| — of which `bufio.(*Writer).Flush` (the per-4 KiB syscall loop) | **15.7%** |
+| — of which `bufio.(*Writer).Write` (the copy + the mask XOR) | ~2.4% |
+| all syscalls, everything | 45.8% |
+
+So about a third of ALL syscall time on the read path is that flush loop, and
+sizing the write buffer to one yamux frame should recover 11-16% of caller CPU.
+
+**The masking is not the cost.** That kills the cheapest option: v1.8.15 ships
+SIMD masking compiled but disabled behind a `TODO: Will enable in v1.9.0`, and a
+3x speedup on 2.4% is noise. Worth taking for free on a routine bump; not worth
+waiting for, and not a substitute for the buffer.
+
+Both numbers are conservative — this was a unix socket with no TLS, and under
+`wss://` every 4 KiB flush is additionally its own TLS record. What the profile
+does NOT establish is whether any of it becomes throughput on a bandwidth-bound
+link; it probably does not, but CPU is CPU for a server carrying many mounts.
+
+## 2026-08-09 — Phase 1.3: GC-proof buffer reuse, and a constant I could not justify
+
+Second step of the performance plan. The measured defect: `blockServer`'s
+whole-frame request buffers lived in a `sync.Pool`, which the collector empties
+on every cycle — while something else on the same path (p9's per-Twrite payload,
+69% of the write leg's bytes) drives collection at roughly the rate we wanted to
+reuse at. So the pool was cleared between one request and the next and
+essentially never hit: 4.7 MB of garbage per 16 MiB written.
+
+### The fix
+
+`scratchList` (`pkg/wire/blockscratch.go`): a small buffered channel of buffers
+the GC cannot empty, with a `sync.Pool` as the overflow tier. A buffer parked in
+a channel is reachable, so no collection takes it; anything beyond the retained
+depth degrades to today's behaviour rather than to fresh allocation. Applied to
+both `reqScratch` (request frames) and `opScratch` (chunk buffers).
+
+Result, 16 MiB sequential, block mode:
+
+| | before | after | raw 9P |
+| --- | --- | --- | --- |
+| seq-write allocated | 22.5 MB | **17.9 MB** | 16.8 MB |
+| seq-read allocated | 8.5 MB | **4.7 MB** | 3.6-4.7 MB |
+
+The read leg is now at raw 9P's level; the write leg is within 1.1 MB of it, and
+what remains there is the p9 payload the next step targets. On the ws profile the
+read leg went 16.4 MB -> 9.3 MB, which is BELOW raw 9P's 9.5-9.9 MB.
+
+### The constant I had to walk back
+
+I wrote the retained depth as 4 and justified it in the comment as follows: the
+loop reads request N+1 while handler N still holds N's buffer, so the steady state
+is two, and a one-deep slot "would recover about half the garbage and look like a
+fix."
+
+The neutralization sweep called that out. Setting the depth to 1 did NOT fail the
+byte-ceiling test, so I measured it properly: **keep=1 and keep=4 are identical**,
+within noise, on every workload the harness can produce — local and ws, read and
+write. The claim was inference written in the register of a measurement, which is
+the specific habit this journal keeps catching.
+
+The depth is now 2, and the comment says what each half of that is worth: 2 is the
+smallest depth that covers the STRUCTURE of `loop()` — it dispatches a write to a
+goroutine and immediately reads the next frame, so it can hold N+1's buffer while
+a handler holds N's, which is readable in the code rather than inferred — and
+anything past 2 is a guess costing ~1 MiB of pinned memory per mount per slot.
+What is actually established is "GC-proof", not "deep".
+
+The caveat is recorded at the constant: the byte-ceiling test **cannot** tell these
+depths apart, because it drives writes synchronously and never has two requests in
+flight. Settling it needs a pipelining client — the real kernel under `cache=mmap`
+writeback, which `TestKernelMountModes` exercises and the in-process harness
+structurally cannot.
+
+### Tests
+
+Three, in the `diskstore_alloc_test.go` house style.
+
+- `TestBlockServerWriteDoesNotAllocateABufferPerRequest` — bytes from
+  `runtime.MemStats` against a loose ceiling (`chunk/4`), measuring 4.3 KB per
+  1 MiB write against ~800 KB when the free list is bypassed. Two deliberate
+  choices: it drives the block server DIRECTLY rather than through a p9 client, so
+  p9's own ~1 MiB per-Twrite buffer is not inside the window forcing a fragile
+  ceiling; and it calls `runtime.GC()` every iteration, which is the point rather
+  than hygiene, since the defect IS "the collector empties the pool between
+  requests" and a `sync.Pool` passes comfortably without it. Positive control: the
+  export must have seen every write, with the bytes and a marker byte checked — a
+  write rejected early allocates nothing and satisfies any ceiling.
+- `TestScratchListSurvivesGC` — the mechanism, asserting the marker byte survives
+  two collections. The two `runtime.GC()` calls ARE the assertion; without them it
+  passes against a `sync.Pool` too.
+- `TestScratchListBoundsRetention` — the counterweight to "GC-proof": overflow
+  must reach the drainable tier, and a wrong-sized buffer must not be retained.
+
+Neutralizations: bypassing the free list fails the first two with their intended
+diagnostics (`799539 bytes allocated per 1048576-byte write`; the marker gone);
+removing the size guard fails the third. The depth neutralization is the one that
+did not fail, and it is why the constant changed.
+
+### Verification
+
+Go gate green under both build tags; `go test ./...` clean. Real kernel mount
+(`TestKernelMountModes`, privileged container) healthy, with block reads now ahead
+of raw 9P (1034 vs 896 MB/s over the mux). One run, so read as a smoke check
+rather than a claim — that instrument's run-to-run spread is wide.
+
+## 2026-08-09 — Phase 2.1: buffered receive, and a counter that had to earn a floor
+
+Taken out of plan order (it is a Phase 2 item and the agreed order was bulk
+first), because the two remaining bulk items are both blocked on decisions — the
+p9 fork on its compliance shape, the WebSocket on a fork-vs-swap choice — and this
+one is cornus-only, unblocked, and not actually confined to small operations: on
+bulk reads every 1 MiB reply was costing three reads.
+
+### The change
+
+Each endpoint now has one `bufio.Reader` in front of its connection. A frame
+arrival used to cost two reads (a 16-byte header, then the payload) and three on
+the direct-delivery read path; buffered, the header and a small payload come out
+of one fill.
+
+Both zero-copy properties are preserved, and that is the constraint that decides
+the buffer size. `bufio` bypasses its buffer for a large read only when the buffer
+is EMPTY, so bulk still lands directly in the requester's buffer and in the block
+server's pooled frame buffer.
+
+`blockReadBuf = 8192`, and the number is a copy budget rather than a round one. It
+must clear the largest NON-bulk frame in a single fill — a page-sized write is
+4096 bytes of body plus header and metadata, a little over 4 KiB, so 4096 would
+just miss on the shape that matters most. And it must stay far below a bulk frame,
+because the staged bytes are bounded by one buffer per frame — against 100% of the
+payload if it ever reached the frame size and the bypass stopped firing.
+
+The reader is constructed BEFORE the handshake and threaded through it
+(`blockClientHandshake`/`blockServerHandshake` now take a writer and a reader
+separately). That is structural, not stylistic: a second reader on the same
+connection silently eats buffered bytes, and building it after the handshake would
+leave a hole the first time `recvHello` over-read.
+
+Syscalls, 16 MiB sequential, block mode:
+
+| | before | after |
+| --- | --- | --- |
+| seq-write | 347 | **308** |
+| seq-read | 323 | **294** |
+| small-sync | 33 | **30** |
+
+### The counter had to earn its floor
+
+The cost of a receive buffer is invisible to every existing counter: the bytes
+still land in the right place, `blitWireRead` totals the same either way,
+allocation does not move (the buffer is per-session and reused), and only wall
+time would drift. So a buffer mistakenly sized at or above a frame would stage
+every payload byte and nothing would say so.
+
+`blitBufCopy` now attributes the SUBSET of `blitWireRead` that passed through a
+receive buffer, using bufio's own bypass rule verbatim so the figure is exact
+rather than estimated. It is computed inside `blitReadFull`, which type-asserts
+the reader — so no call site changed and the accounting still cannot drift from
+the read it accounts for. Measured: **135,915 bytes per 16 MiB written (0.81%)**
+and 103,155 per 16 MiB read (0.61%), which is the "~0.8%" the constant's comment
+claimed, now measured instead of asserted.
+
+`TestBufferedReceiveDoesNotStageBulk` pins it. Sizing the buffer to a frame fails
+it with `buf-copy = 8389904 bytes for 8388608 moved` — the whole payload staged,
+exactly the described failure.
+
+**The second neutralization is why the test has a floor.** Breaking the
+attribution so it never reports a staged byte passed the ceiling comfortably: a
+counter that stops counting looks like a free lunch. Every frame header is read
+into an empty buffer smaller than the buffer size, so bufio stages it by
+construction and the count cannot legitimately be zero. The floor now says so, and
+the neutralization fails with `buf-copy = 0 while a buffered reader is in use`.
+
+That is the second time this session a ceiling-only assertion has been satisfied
+by an instrument that quietly stopped working. Ceilings need floors when the thing
+being measured is a measurement.
+
+### Verification
+
+Go gate green under both build tags. `blit-user-copy` and `blit-msg-append` stay
+at 0 and `blit-wire-read` stays at exactly 1x payload, so the data path is still
+one landing per direction.
+
+## 2026-08-09 — Phase 1.2: forking p9 to stop allocating a buffer per write
+
+The largest single item in the performance plan, and the only one that could not
+be done from cornus: `p9.recv` allocated a fresh payload buffer for every Twrite —
+about a megabyte of garbage per megabyte written, measured at 69% of the write
+leg's allocated bytes, and paid by BOTH mount protocols since each runs a p9
+server somewhere.
+
+`third_party/p9` now vendors `hugelgupf/p9@v0.4.1` with that one change.
+
+### The change is upstream's own read-side pattern, mirrored
+
+The reuse machinery already existed and simply never fired. `recv` keeps a payload
+buffer when the message already has one of the right size; `registry.put` nils the
+payload before returning the message struct to its cache, so every message arrived
+with `Data == nil`.
+
+The tempting one-line fix — stop nil'ing, and make the size check a capacity check
+— is wrong twice over. The registry cache is **process-global and shared across
+connections**, so retained buffers would cross connection boundaries; and a
+capacity-based reuse in `recv` would also apply to the CLIENT, where `Payload()`
+is the *caller's* buffer (`clientFile.readAt` sets `rread.Data` to the caller's
+slice), so a server returning more than was asked for could scribble past it.
+
+Upstream had already solved the same problem in the other direction: `tread`
+borrows an msize-shaped buffer from `connState.readBufPool` and returns it in
+`rreadServerPayloader.PayloadCleanup`. So the fork is that pattern applied to
+writes — a `payloadAllocator` interface implemented only by `*twrite`, which is
+the one payloader both decoded on the receive path and drawn from the registry.
+Buffers come from and return to the receiving connection's pool, and
+`releasePayload` clears the connection reference before the message can re-enter
+the global cache. `allocPayload` returns `buf[:n:n]`, so a `File` cannot reslice
+into what an earlier request left behind, and `recv` fills `[0,n)` completely
+before any handler runs.
+
+Four files, one documentation-only: `p9/file.go` now states that `File.WriteAt`
+must not retain `p`. That sentence is the contract the whole change rests on, and
+it is what `io.WriterAt` already says; cornus was already compliant — `WriteAt`
+passes the buffer into a synchronous round trip and the cache stores copies.
+
+### The result
+
+| 16 MiB sequential | before the fork | after |
+| --- | --- | --- |
+| block seq-write allocated | 17.9 MB | **5.3 MB** |
+| raw 9P seq-write allocated | 16.8 MB | **5.3 MB** |
+
+Both protocols, because both run a p9 server. Cumulatively across the three steps
+so far, the block write leg went 22.5 MB -> 5.3 MB per 16 MiB, and syscalls 347 ->
+~310. In the fork's own units: 36 KB allocated per 1 MiB Twrite, against 1054 KB
+with the reuse removed.
+
+### Making the fork checkable rather than trusted
+
+The yamux fork has upstream's suite in CI, which catches semantic breakage but
+cannot catch a stray edit to a file with weak coverage. This one adds two things:
+
+- `cornus.patch` — the complete normalised diff against pristine upstream, so
+  reviewing the fork is reviewing one file. `regen-patch.sh` produces it with
+  fixed path prefixes and no timestamps, and regenerating it is byte-identical.
+- A CI step that regenerates it and diffs. That turns "is this vendored copy
+  faithful?" into a build failure rather than a promise. **Worth retrofitting to
+  `third_party/yamux`**, which is much larger and has no such check.
+
+Also given a provenance README, in the `third_party/herdr` style — which the yamux
+fork never had, so it got one too in the same change.
+
+### A compliance bug the fork exposed
+
+`gen_notices.py` emitted its "modified copy" annotation only when
+`category == "weak-copyleft"`. That was true-by-accident: the sole modified copy
+was MPL. An Apache-2.0 or ISC fork would have been listed as if pristine — exactly
+what Apache section 4(b) exists to prevent. The annotation is now driven by a
+`| Modified | yes |` row in the copy's provenance README, read alongside the
+`| Upstream |` row the scanner already parses.
+
+Verified by regeneration: the notices differ from the committed file by **exactly
+one line**, the new p9 entry. yamux's line is byte-identical, so the fix did not
+disturb the existing annotation, and `herdr` (Apache-2.0, unmodified) correctly
+gets none.
+
+Section 4(b) notices are on each of the four modified files; `NOTICE` now names
+both modified copies.
+
+### The nested-module tax, paid
+
+`pkg/wire/sqliteab/go.mod` needed the `replace` too — without it the SQLite
+harness would keep measuring UPSTREAM p9 and the pooling it exists to measure
+would silently not be there. `pkg/wire/qosab/netemab` does not import cornus, so
+it does not need one. Every future nested module that reaches `pkg/wire` inherits
+this.
+
+### Tests, and one that had to be gated
+
+`p9/twrite_payload_test.go`: payload exactness across descending sizes (a large
+write followed by a small one is the shape that exposes a reused buffer, and each
+request uses a distinct filler byte so a leaked tail is identifiable); that a
+cached message drops its connection reference; and the allocation ceiling.
+
+All three neutralize: reverting `recv` gives `1054431 bytes allocated per 1047552-byte
+payload`; keeping the connection reference fails the cache test by name; removing
+the three-index bound fails with `payload cap 65536 != len 65436`.
+
+**The allocation test skips under `-race`,** and that is not a dodge. Race
+instrumentation allocates 200-365 KB/op here against the 36 KB being measured,
+straddling any ceiling tight enough to catch the regression — the test failed 1 run
+in 3 before I gated it. CI therefore runs the fork twice: `-race` for the
+correctness tests, and a plain pass for the ceiling, or the one test guarding the
+fork's whole purpose would never execute. This is the same trap as the
+pre-existing `pkg/blockcache` race-only failure already filed in TODO.md; the
+cornus-side equivalent was checked and has a 56x margin, so it needs no gate.
+
+### Verification
+
+Go gate green under both build tags; `go test ./...` clean; `make e2e-check`
+parses every scenario. Fork suite green under `-race`; the faithfulness gate
+passes locally. Real kernel mount healthy (block 848.7 MB/s write vs raw 827.0,
+reads 1018 vs 1104) — one run, so a smoke check rather than a claim.
+
+## 2026-08-09 — Phase 1.1: forking coder/websocket, and a 22x cut in caller syscalls
+
+The last of the three bulk-path items, and the one whose mechanism I got wrong in
+the approved plan. `third_party/websocket` now vendors `coder/websocket@v1.8.15`
+with one addition: `DialOptions.WriteBufferSize`.
+
+### What the option is for
+
+RFC 6455 makes a WebSocket CLIENT mask every byte it sends, and
+`writeFramePayload` masks and flushes in chunks bounded by the connection's
+`bufio.Writer` — hardcoded at bufio's 4096-byte default. So a client sending N
+bytes issues `ceil(N/4096)` write syscalls **regardless of framing**. Bigger yamux
+frames, fewer frames, a larger `MaxDataFrame`: none of them change it. Only the
+buffer does.
+
+In cornus the client is the deploy caller, which dials and then serves the mount
+export, so it is paid on read replies — the bulk direction for a container reading
+its mount.
+
+| 16 MiB sequential read, caller-side syscalls | before | after |
+| --- | --- | --- |
+| block | 4274 | **194** |
+| raw 9P | 4322 | **242** |
+
+A 22x reduction, and it lands on both protocols because it is a transport cost.
+`(128 << 10) + 4096` is the size: the forked yamux's single-DATA-frame cap plus
+room for that frame's yamux and masked-WebSocket headers, so one yamux frame
+leaves in one write. Larger buys nothing — yamux never hands the connection more
+than one frame at a time.
+
+### Why it needed a fork, restated because I had this wrong
+
+The approved plan said the buffer was unreachable through `DialOptions` but that
+it flushed into the HTTP transport's writer, making
+`http.Transport.WriteBufferSize` a few-line fix. It does not: after a 101 upgrade
+`net/http` returns `newReadWriteCloserBody(pc.br, pc.conn)`, so the write half is
+the RAW conn and anything supplied sits below the 4 KiB buffer, still seeing every
+flush. Interposing a buffering conn is worse than useless — nothing there knows
+where a frame ends, and flush-on-read cannot rescue it because yamux keeps a
+goroutine parked in `Read`.
+
+So: one file, fifteen lines. `write.go` is untouched, and that is the point —
+masking is chunk-size independent because `writeFramePayload` already threads the
+rotated key across chunks, so the bytes on the wire are identical at any size.
+Custom-sized writers are kept out of the shared pool, which is not
+size-segregated: one entering it would be handed to the next connection that asked
+for a default.
+
+### The test that was vacuous until the sweep caught it
+
+Three tests: that the size reaches the flush loop (32 writes at 4 KiB, 4 at 32
+KiB, 1 at 132 KiB for a 128 KiB payload), that the masked bytes are byte-identical
+across buffer sizes, and that a custom-sized writer never enters the shared pool.
+
+The byte-identity one **passed with the mask-key rotation deleted**. `maskGo`
+rotates the key by `len(chunk) % 4`, and every buffer size I had chosen was a
+multiple of four — so the rotation was the identity and "carrying the key across
+chunks" was untestable. A version that dropped the returned key produced identical
+bytes and the test proved nothing. It now uses 1023, 4099 and 70001, and the
+neutralization fails with `buffer 1023 produced different masked bytes`.
+
+That is the third vacuous assertion this session, and all three had the same
+shape: the test exercised a case where the thing under test could not matter.
+
+### Housekeeping
+
+Provenance README, `cornus.patch` + `regen-patch.sh`, and a CI faithfulness gate,
+as for p9. ISC imposes no duty to mark modified files; `dial.go` is marked anyway,
+because the next reader needs to know which lines are not upstream's. `NOTICE` and
+`THIRD_PARTY_NOTICES.md` now name three modified copies — the regenerated notices
+differ from the committed file by exactly the one new line, so the annotation fix
+from the p9 change handles ISC correctly too.
+
+The p9 faithfulness gate **caught a real staleness** while I was here: I had
+generated its patch before adding the race-gating test files, so the committed
+patch no longer matched. Exactly what the gate is for, on its first day.
+
+`go vet` is not run over this module in CI: v1.8.15 emits two `mask_arm64.s`
+symbol warnings on arm64 that pristine upstream emits identically.
+
+### Verification
+
+Go gate green under both build tags; `go test ./...` clean; `make e2e-check`
+parses every scenario. Both fork suites pass, both faithfulness gates pass. Real
+kernel mount with both forks in place: block 964 MB/s write / 1410 MB/s read
+against raw 9P's 763 / 1058 — one run, so a smoke check rather than a claim.
+
+### End-to-end, on the real stack
+
+`bench-mount-modes.star` on the docker host-mount path, best-of-three per metric,
+with both forks in place — and compared against the same benchmark before this
+round of work, since the interesting movement is ABSOLUTE, not the ratio:
+
+| metric | raw 9P before | raw 9P now | block before | block now |
+| --- | --- | --- | --- | --- |
+| sequential write | 311.2 MB/s | **344.9** | 359.0 MB/s | 358.1 |
+| sequential read | 383.7 MB/s | **426.8** | 363.0 MB/s | **412.5** |
+| fsync latency | 2.742 ms/op | 2.883 | 2.342 ms/op | 2.615 |
+
+Reads are up ~11% for raw 9P and ~14% for the block protocol. That is the shape to
+expect: the two forks removed an allocation and a syscall storm that BOTH mount
+protocols were paying, so the A/B ratio barely moves (write 1.04x, read 0.97x,
+fsync 1.10x in block's favour) while both get faster. Optimizing a shared layer
+does not show up in a comparison between the things sharing it — which is why the
+absolute columns are the ones to read here, and why the per-hop counters in
+`BenchmarkMount` exist at all.
+
+## 2026-08-09 — Layered pools: a GC-proof tier in front of p9's read buffer pool
+
+Asked for a plan around `sync.Pool` and `net.Buffers`, and corrected twice while
+making it — both corrections improved the result, so they are the interesting part.
+
+### Two corrections to my own analysis
+
+**Masking does not force a copy.** I had written that RFC 6455 made a copy-free
+WebSocket client send impossible "by construction". It does not: masking is XOR
+with a rotating key, an involution, and `maskGo` already works in place on an
+arbitrary slice. The payload can be masked where it lies and written directly. The
+arithmetic then decides: masking in place and restoring afterwards is a WASH (the
+restore costs exactly what the copy did, plus a syscall), but a *destructive*
+write — one permitted to leave the buffer masked — saves a full pass over every
+byte. That contract is already satisfied in fact on the read-reply path, where the
+payload is pooled scratch that is never read again; what is missing is a way to say
+so. Planned, not built; it is the sharpest item on the list in both senses.
+
+**My benchmark filters were mixing transports.** `go test -bench` matches each
+`/`-separated element UNANCHORED, so `-bench BenchmarkMount/local/...` also
+selects `ws-local`. Every profile I took for the plan was a blend of the two — and
+it mattered, because the `local` profile has no yamux at all, so a yamux cost
+showing up under "local" was pure contamination. All figures re-taken with
+`'^BenchmarkMount$/^local$/^seq-write$/^block$'`. Anyone re-running these must
+anchor, or they will measure something else.
+
+### Two populations of buffer consumer, and they need different policies
+
+The framing came from the user and the measurements support it exactly:
+
+- **Bulk** (128 KiB - 1 MiB, few in flight): the pools EXIST and FAIL. On the
+  production shape, `p9`'s `readBufPool` missing was 33% of allocated bytes and
+  yamux's growing receive buffer another 32%.
+- **Small-frequent** (16 B - 4 KiB, one or more per request): the pools DO NOT
+  EXIST. On the small-op path, `readRequest` 16.8%, `p9.send`'s per-message
+  `net.Buffers` 8.4%, `readLoop` 5.8%.
+
+So "add buffer pools" was the wrong instruction for half of it. What the bulk half
+needed was a tier the collector cannot empty.
+
+### The fix, and why one slot
+
+`connState.getReadBuf`/`putReadBuf` in the p9 fork: a single
+`atomic.Pointer[[]byte]` checked before `readBufPool`.
+
+A `sync.Pool` is emptied completely by every collection, and on this path the
+pool's own misses are what drive the next collection — a miss allocates a whole
+msize buffer, that brings the collector round, and the collector empties the pool
+before the next request. Self-reinforcing, and no amount of `sync.Pool` fixes it.
+The profile showed it missing with only ONE request in flight, so it was never
+contention.
+
+One slot, not a ring and not the concurrency bound: the steady state of sequential
+I/O is one buffer in flight, each slot pins msize per connection permanently (the
+same order as `pristineZeros`, which the connection already holds), and bursts fall
+through to the pool, which returns idle memory. The locality argument is the other
+half of why a slot beats a pool even when the pool hits: no pin/unpin, no interface
+boxing, and the buffer stays in the owning core's cache instead of arriving cold
+from another P.
+
+### Result
+
+| | before | after |
+| --- | --- | --- |
+| `readBufPool` misses (ws, 20 x 16 MiB) | 82.1 MB | **19.7 MB** |
+| allocated per op, `local/seq-write` | 5.12 MB | **2.18 MB** |
+| allocated per op, `ws-local/seq-write` | 9.28 MB | **6.3 MB** |
+| `recv` allocation per 1 MiB Twrite (fork's own test) | 36 KB | **4.7 KB** |
+
+Throughput unchanged within noise (959-983 MB/s local, 626-717 ws). The residual
+19.7 MB is one buffer per connection — the unavoidable first fill — so in steady
+state the slot now hits essentially always.
+
+`bytes.growSlice` under yamux's receive path is now the largest single item at
+44%. That is the next step, and it needs measuring before acting: the buffer grows
+once per stream and is never shrunk, so a long-lived mount amortises it and only
+stream-churn workloads would feel it.
+
+### Tests
+
+`TestReadBufHotSlotSurvivesGC`, in the fork. Two `runtime.GC()` calls ARE the
+assertion — the existing allocation ceiling cannot see this at all, because it runs
+with a warm pool and one buffer in flight and passes with or without the slot.
+Asserts on the BACKING ARRAY (a marker byte), since a fresh buffer of the right
+size would satisfy any size check, and separately that the slot holds exactly one
+buffer, which is the memory promise.
+
+Neutralized both ways: bypassing the slot on get fails with the marker gone;
+making the put unbounded fails with "the hot slot took the second buffer as well".
+
+### Verification
+
+Go gate green under both build tags, `go test ./...` clean, `make e2e-check`
+parses every scenario, both fork suites pass under `-race`, both faithfulness
+gates pass (p9's patch regenerated to include the change).
+
+## 2026-08-09 — The yamux receive-buffer measurement, and the finding it turned up
+
+The plan said measure before acting on `bytes.growSlice` under
+`yamux.(*Stream).readData` — the largest allocation item left after the p9 tier-0
+change — because the mount benchmark opens a fresh stream per iteration, the one
+shape that cannot amortise anything. The measurement says the cost IS per-stream,
+and it also turned up something the allocation question was not asking about.
+
+### The measurement
+
+`BenchmarkYamuxStreamChurn` holds the total bytes constant and varies how many
+streams carry them, which separates a per-byte cost from a per-stream one. 32 MiB
+over one session:
+
+| streams | bytes each | allocated | per byte moved |
+| --- | --- | --- | --- |
+| 1 | 32 MiB | 17.3 MB | 0.52x |
+| 8 | 4 MiB | 49.9 MB | 1.49x |
+| 64 | 512 KiB | 86.9 MB | 2.59x |
+| 512 | 64 KiB | 109.5 MB | 3.26x |
+
+A 6.3x spread at identical bytes moved. So it is per-stream, as suspected, and the
+conclusion for a client-local mount — which holds ONE stream for its whole life —
+is that the allocation RATE amortises to nothing. No action needed for mount
+throughput.
+
+That was the question. The answer is "don't act", which is worth having.
+
+### What the measurement turned up instead
+
+Even at one stream, `growSlice` is 87% of the allocation, so I measured the
+buffer's high-water mark directly rather than inferring it from the doubling
+ladder. `TestRecvBufHighWaterMark` in the fork, 8 MiB on one stream with a
+deliberately lagging consumer:
+
+```
+receive buffer high-water mark after 8 MiB on one stream: 8192 KiB
+(stream window cap 16384 KiB)
+```
+
+The buffer grows to whatever is in flight, bounded only by the stream window —
+which cornus deliberately sets to 16 MiB — and **nothing ever releases it**.
+`Shrink()` exists in yamux for exactly this and cornus never calls it, so the
+buffer keeps its high-water mark for the life of the stream.
+
+The direction matters: it is the RECEIVER that buffers, and for a client-local
+mount the bulk direction is read replies flowing caller -> server. So the buffer
+that grows is the **cornus server's**, one per mount, up to 16 MiB each. Server
+memory scales with mount count in a way nothing here had accounted for — ten
+mounts is up to 160 MiB of yamux receive buffers, resident, whether or not the
+mounts are busy.
+
+That is a footprint finding, not an allocation-rate finding, and it is why the
+answer to "should we pool this?" is not simply "no, it amortises".
+
+### What I did NOT do
+
+No fix, deliberately, because the two candidate fixes trade against each other and
+the choice needs a decision rather than a preference:
+
+- **Calling `Shrink()` when a stream drains** releases the memory, but a bulk mount
+  stream drains and refills continuously, so it would pay the doubling ladder over
+  and over — trading a footprint problem for the allocation problem this
+  measurement just showed is per-stream. Shrinking on IDLE rather than on drain is
+  the version that could work.
+- **Pooling the buffer across streams** (with a capacity cap, the `frameBufPool`
+  pattern already in that package) fixes the churn case and makes a shrink cheap,
+  since a released buffer goes to the pool rather than the collector. It does not
+  by itself reduce residency for a steady mount.
+
+They compose — shrink-on-idle plus a pool — but only if the idle threshold is
+chosen with a measurement of real mount traffic, which I do not have.
+
+### Verification
+
+`go test -short` green in the yamux fork (16 s), cornus gate green. The probe is a
+report-style test like `TestKernelMountModes`: it asserts only that it measured
+something, because the number it prints is the point and no fixed threshold would
+survive a config change.
+
+## 2026-08-09 — Pooling yamux's receive buffers, and a design the measurement rejected twice
+
+Follow-on from the measurement above, prompted by the observation that a pool
+makes `Shrink()` affordable — release the buffer and a busy stream takes a grown
+one back instead of re-climbing the doubling ladder. The reasoning is right; the
+premise needed correcting and the placement needed measuring, and both corrections
+came from running it rather than arguing about it.
+
+### The premise, corrected
+
+There was no common pool. What existed was three unrelated per-module pools:
+cornus's `scratchList`, p9's tier-0 slot, and yamux's `frameBufPool` — the last
+for SEND frames and capped at 128 KiB, far below the 16 MiB a receive buffer can
+reach. The cross-module allocator was proposed in the plan, not built.
+
+It turned out not to be needed: `recvBuf` never leaves yamux, so the pool belongs
+in the fork, and the win is available without any cross-module machinery.
+
+### This pool is deliberately GC-drainable, unlike the last one
+
+The opposite of the choice made for p9's read buffers a few hours earlier, and the
+contrast is the useful part. There, a collection emptying the pool caused misses
+that allocated a megabyte and drove the next collection — so it needed a tier the
+collector could not touch. Here, the collector emptying the pool is *precisely the
+mechanism* that returns an idle mount's memory to the process. A retained tier
+would pin exactly what this is trying to give back.
+
+Same primitive, opposite policy, decided by what the class is for. That is what
+"layered" has to mean if it means anything.
+
+Size classes are powers of two here, which would have been wrong for the frame
+buffers: `MaxDataFrame + headerSize` sits just over 128 KiB, so a power-of-two
+ladder would round up and double the pinned memory. `recvBuf`'s size is set by
+traffic, not by a protocol constant, so nothing rounds up.
+
+### The measurement rejected my first placement, and then my first lookup
+
+**Release on drain was wrong.** It is the obvious reading of "make Shrink
+affordable", and 32 MiB moved over varying stream counts says:
+
+| streams | before | release-on-drain |
+| --- | --- | --- |
+| 1 | 17.3 MB | **52.9 MB** |
+| 64 | 86.9 MB | 35.0 MB |
+| 512 | 109.5 MB | 4.8 MB |
+
+Churn improved 20x and the single long-lived stream got **three times worse** —
+which is the mount, the case that matters most. A bulk stream drains and refills
+continuously, so "on drain" fires constantly and churns the pool.
+
+Recycling at **teardown** instead targets the cost that is actually per-stream,
+and a long-lived stream never reaches that path at all:
+
+| streams | before | at teardown |
+| --- | --- | --- |
+| 1 | 17.3 MB @ 2520 MB/s | 19.5-30.3 MB @ 2341-2442 |
+| 8 | 49.9 MB @ 1709 | 40.8 MB @ 2006-2385 |
+| 64 | 86.9 MB @ 873 | 5.0-22.1 MB @ 1903-3531 |
+| 512 | 109.5 MB @ 847 | **4.1-6.0 MB @ 2397-2714** |
+
+Throughput up 2-3x on the churn rows. The production mount shape is unchanged
+(`ws-local` seq-write 636-685 MB/s, seq-read 915-1069, allocation flat) — by
+construction, not by luck.
+
+**Then the lookup was wrong, and a test caught it.** A grown buffer is filed by its
+final capacity, but a stream asks by its FIRST frame's length, which is small — so
+looking only in the fitting class left every grown buffer stranded and a stream
+that went quiet and busy again re-climbed the whole ladder. `getRecvBuf` now
+searches upward from the fitting class. `TestRecvBufPoolReusesGrownBuffers` failed
+on exactly this before the fix, which is what it was written for.
+
+### What is now pinned, and what is not
+
+The high-water mark is unchanged and worth restating: a busy stream's receive
+buffer grows to whatever is in flight, bounded only by the 16 MiB stream window.
+Pooling does not reduce that; it stops each stream paying the ladder to get there
+and lets a torn-down stream's buffer serve the next one. Reducing the mark itself
+would mean reducing the window, which was deliberately raised for throughput.
+
+### Tests
+
+Four in the fork, all with the assertion doing real work: recycling happens at
+teardown (with a control proving the transfer occurred, or "released" would be
+vacuous); grown buffers come back with capacity intact; the pool is GC-drainable
+(two collections, since sync.Pool keeps a victim cache for one); and the filing
+rule never hands back an undersized buffer.
+
+### Verification
+
+Upstream yamux suite green (`-short`, 16 s) — only my own probe failed at each
+step, and each time because it asserted the behaviour I had just changed. cornus
+gate green under both build tags, `go test ./...` clean, p9 and websocket fork
+suites green, both faithfulness gates pass.
+
+## 2026-08-09 — Correction: the teardown recycle in the entry above was wrong, and `-race` proved it
+
+The entry above records recycling yamux receive buffers **at stream teardown**. That
+is now wrong in the tree and should not be followed: it deadlocked, then lost data.
+Both were found by the `-race` suite, which I had not managed to run to completion
+when I wrote it — the earlier gate command timed out at two minutes and I moved on
+with only the non-race run green. The write-up went out ahead of its evidence.
+
+### What went wrong, in order
+
+**A deadlock.** `Session.closeStream` is reached from `processFlags`, which holds
+`stateLock` — upstream's comment there says "close the stream without holding the
+state lock", but its two defers run LIFO, so the close runs first, with the lock
+still held. Taking `recvLock` from inside that closed an ABBA cycle against any
+reader in `sendWindowUpdate`, which takes `recvLock` then `stateLock`. The suite
+hung for the full 600 s timeout.
+
+Making the recycle non-blocking (`TryLock`, skip on contention) broke the cycle —
+recycling is opportunistic, so giving up costs only a missed recycle.
+
+**Then intermittent data loss.** With the deadlock gone,
+`TestHalfCloseSessionShutdown` began failing about one run in three: a reader that
+must still drain buffered data after the sender's session closes got 212 992 bytes
+instead of the full transfer. Baseline was 3/3 clean, so it was mine.
+
+Bisecting it — pool without the teardown hook — cleared the failure, which located
+it in the hook rather than in the pool.
+
+### The fix, and why this hook is provably right where the other was not
+
+The buffer is now released where the reader observes **EOF**: `Stream.Read`'s
+closed / remote-closed branch, at the exact point it has found the buffer empty and
+is about to return `io.EOF`. That assertion — the peer will send no more, and the
+reader has drained everything — is precisely the precondition for recycling, and it
+is established by the code path itself rather than inferred from a lifecycle event.
+
+`closeStream` established neither: not that data had stopped arriving, and not that
+the consumer was finished. It also ran on the receive-loop goroutine under a lock
+held for other reasons, which is what made it deadlock-prone. Both problems came
+from hooking a *lifecycle* event when what the operation needs is a *data* fact.
+
+Five `-race` runs clean, against a 3/3 clean baseline.
+
+### A second defect the same runs exposed, in my own tests
+
+`TestRecvBufPoolReusesGrownBuffers` failed about three runs in five for an unrelated
+reason: it drained and inspected the package-global pool while the rest of the
+suite's live sessions were concurrently taking buffers from it. The test was
+measuring the suite, not the code.
+
+The pool is now a value (`recvBufPool`) with a process-wide default instance, so a
+test can construct its own. That is better design independently, and it is the kind
+of flake that gets a real failure dismissed later.
+
+### Where the numbers landed
+
+| streams (32 MiB total) | baseline | final |
+| --- | --- | --- |
+| 1 | 17.3 MB @ 2520 MB/s | 22.2 MB @ 2582-2669 |
+| 8 | 49.9 MB @ 1709 | 35.6-48.9 MB @ 1963-2182 |
+| 64 | 86.9 MB @ 873 | 36.8 MB @ 2071-2489 |
+| 512 | 109.5 MB @ 847 | **6.3 MB @ 2537-2627** |
+
+Churn allocation down 94% at 512 streams with throughput up ~3x. The single-stream
+row is ~28% MORE allocation than baseline — the honest cost of releasing and
+re-acquiring — while its throughput is unchanged or slightly better. The production
+mount shape is unaffected (`ws-local` seq-write 695-702 MB/s, seq-read 1027-1034),
+which is the case that mattered most.
+
+Recycling at EOF also recovers less than the teardown hook did at 64 streams
+(36.8 MB against 5-22 MB): it only fires for streams whose reader actually reaches
+EOF. That is the price of the hook being correct, and it is the right trade.
+
+### The lesson, which is not "run the tests"
+
+I did run them — the non-race suite was green at every step, and both defects were
+invisible to it. The failure was declaring a result on the strength of the cheap
+signal after the expensive one had timed out, instead of treating the missing
+signal as missing. A gate that did not finish is not a gate that passed.
+
+## 2026-08-09 — Full E2E benchmark on the final build, and a second estimator correction
+
+Both benchmark scenarios run in the privileged docker runner, four runs of
+`bench-mount-modes` on the final build (p9 tier-0 slot + yamux receive-buffer pool
+on top of both forks).
+
+### Where the block protocol lands
+
+Best-of-three per metric, four runs:
+
+| metric | raw 9P (mean) | block (mean) | ratio |
+| --- | --- | --- | --- |
+| sequential write | 354.4 MB/s | 376.3 MB/s | **1.06x** |
+| sequential read | 441.8 MB/s | 422.6 MB/s | 0.96x |
+| fsync latency | 2.62 ms/op | 2.71 ms/op | too noisy to call |
+
+Against where this session started — `0.85x / 0.88x / 1.20x slower` — write and
+fsync have crossed over and read is at parity. The cached `:async` path
+(`bench-mount-write`) reads 500.7 MB/s and writes 247.5 against a container-local
+653.3 MB/s baseline.
+
+### The estimator was wrong for one of the three metrics
+
+I switched this scenario to best-of-three earlier in the session after a single
+sample produced a phantom 4x regression, and justified it as "noise here is
+one-sided: contention can only make a run slower". That is right for throughput and
+wrong for the fsync metric, which has a fat low tail.
+
+Over three runs raw 9P sampled 0.239-0.353 s against the block protocol's
+0.259-0.306 s. Best-of took raw 9P's lucky 0.239 and reported the block protocol
+**16% worse**; the medians (0.317 vs 0.295) say it is better, and its spread is 18%
+against raw 9P's 48%. Same data, opposite conclusion, chosen by the summary
+statistic.
+
+So the scenario now logs **best, median and spread** for every metric, keeps
+best-of as the recorded value (so the numbers stay comparable with what is already
+in this journal), and states the rule: **if best and median disagree on the sign,
+the metric is not resolved at this sample count — that calls for more runs, not a
+verdict.**
+
+It paid for itself on the next run, which reported raw 9P's sequential write with a
+**137% spread** (best 0.167 s, median 0.206 s) against the block protocol's 19%.
+Without the spread beside it, that 383.8 MB/s reads as a solid figure rather than
+one barely resolved.
+
+### What this says about the ratios above
+
+The write and read ratios are stable across runs and worth quoting. The fsync ratio
+is not: block wins it in one run of four on best-of, and wins on medians. The
+honest statement is that fsync is now equivalent, with the block protocol's
+distribution noticeably tighter — which for a per-operation latency is arguably the
+better property, and is not visible in a ratio of minima at all.
+
+### Verification
+
+`all 2 scenario(s) passed` on every run. Full Go gate green under both build tags,
+both fork faithfulness gates pass, `make e2e-check` parses every scenario.
+
+## 2026-08-09 — the session's work as a topic branch, and two gates that only fail elsewhere
+
+Packaged this session's mount-path work as `perf/client-local-mount-path`
+(185 files, +29616) branched from the pre-session commit `d402fde`.
+
+The repo is maintained as a repeatedly-amended single `Initial.` commit, and
+another agent was working concurrently in the same checkout with 182 paths staged
+in the shared index. Branching therefore used a **temporary index** so nothing
+touched the shared one:
+
+```sh
+export GIT_INDEX_FILE=$SP/topic.index
+git read-tree d402fde                  # pre-session base, not HEAD
+git add -A -- <only this session's paths>
+git branch perf/client-local-mount-path "$(git commit-tree "$(git write-tree)" -p d402fde -F msg)"
+```
+
+HEAD, the shared index and the working tree were all left exactly as found. The
+branch carries nothing from the other agent's areas (`docs/`, `pkg/deploy/`,
+`e2e/container`, `e2e/scenarios`).
+
+### Verifying the branch found two defects the main tree structurally cannot show
+
+The previous entry ends "both fork faithfulness gates pass". That was true where it
+was run and **false on any other machine** — a green that came from the checkout
+path rather than from the content. Checking the branch out in a scratch worktree is
+what exposed both, and neither had anything to do with the code under test.
+
+1. **`cornus.patch` embedded absolute paths.** `diff -ru` writes the paths it was
+   given into every `---`/`+++` header, so both patches carried `/home/moriyoshi/…`
+   and the CI gate — `regen-patch.sh | diff - cornus.patch` — would have failed on
+   every runner, forever. Both `regen-patch.sh` scripts now normalise the two roots
+   to `upstream`/`fork` and strip the trailing timestamp field.
+
+2. **git silently dropped a file, so the vendored copy was incomplete in a
+   checkout.** `third_party/websocket/ci/out/.gitignore` contains `*` — it ignores
+   itself. `git add -A` skipped it without a word, the directory vanished (git
+   tracks no empty directories), and the gate in a fresh worktree reported
+   `Only in upstream/ci: out`. Fixed with `git add -f`, keeping the vendored tree
+   byte-identical to upstream rather than adding an exclusion that would weaken the
+   gate.
+
+**The reusable lesson: a reproducibility gate verified only in the tree that
+generated it is not verified.** Both defects are invisible in-place by
+construction — one because the path is the same path, the other because the file is
+present on disk and only missing from the object store. The check is to run the
+gate from a `git worktree add --detach` of the branch, which is the closest local
+approximation of what CI does.
+
+### Verification
+
+From a scratch worktree of the branch: `gofmt -l` clean, `go build ./...` and
+`go build -tags blitprof ./...`, `go vet ./...`, `go test ./...` and
+`go test -tags blitprof ./pkg/wire/` all pass; both fork faithfulness gates now
+pass **from a foreign checkout path**; `make e2e-check` parses every scenario.

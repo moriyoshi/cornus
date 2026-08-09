@@ -52,10 +52,42 @@ func yamuxConfig() *yamux.Config {
 	return cfg
 }
 
+// wsWriteBufferSize is the buffer every cornus WebSocket CLIENT masks and flushes
+// through, and it is sized to hold one whole yamux frame.
+//
+// It matters only on the client side, and only because of masking. RFC 6455 makes
+// a client mask every byte it sends, and coder/websocket masks and flushes in
+// chunks bounded by this buffer — so at the 4096-byte default a client issues one
+// write syscall per 4 KiB regardless of how the bytes are framed. For cornus that
+// lands on the DEPLOY CALLER, which dials and serves the export, so it is paid on
+// read replies: a container reading 16 MiB from its mount cost the caller ~4300
+// write syscalls, about a third of all syscall time on that path and 11-16% of its
+// CPU (profiled; see .agents/docs/JOURNAL.md).
+//
+// 128 KiB is the forked yamux's single-DATA-frame cap (defaultMaxDataFrame), plus
+// room for that frame's 12-byte yamux header and the masked WebSocket header, so
+// one yamux frame leaves in one write. Larger buys nothing: yamux never hands the
+// connection more than one frame at a time.
+//
+// This needs the in-repo websocket fork (third_party/websocket), which adds the
+// option; upstream v1.8.15 has no way to reach the buffer.
+const wsWriteBufferSize = (128 << 10) + 4096
+
+// withWriteBuffer applies wsWriteBufferSize to opts, allocating them if the caller
+// had none. Every client dial in this package goes through it, so no dial can
+// quietly keep the 4 KiB default.
+func withWriteBuffer(opts *websocket.DialOptions) *websocket.DialOptions {
+	if opts == nil {
+		opts = &websocket.DialOptions{}
+	}
+	opts.WriteBufferSize = wsWriteBufferSize
+	return opts
+}
+
 // dial opens the WebSocket to a cornus endpoint and returns a yamux client
 // session over it.
 func dial(ctx context.Context, url string) (*yamux.Session, error) {
-	c, _, err := websocket.Dial(ctx, url, nil)
+	c, _, err := websocket.Dial(ctx, url, withWriteBuffer(nil))
 	if err != nil {
 		return nil, fmt.Errorf("wire: dial %s: %w", url, err)
 	}

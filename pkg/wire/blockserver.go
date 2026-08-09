@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"bufio"
+	"errors"
 	"io"
 	"net"
 	pathpkg "path"
@@ -27,7 +29,9 @@ import (
 // — see the Concurrency note on the fields below, which is the authoritative
 // description of what runs where.
 type blockServer struct {
-	conn      net.Conn
+	conn net.Conn
+	// br is the ONLY reader of conn (see blockReadBuf).
+	br        *bufio.Reader
 	chunkSize int64
 	maxFrame  int
 	attacher  p9.Attacher
@@ -56,13 +60,14 @@ type blockServer struct {
 	// wire; readSem/writeSem bound concurrent readers/writers; opScratch pools
 	// per-handler chunk buffers (the serial fsync path keeps using the single
 	// `scratch`).
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	readSem   chan struct{}
-	writeSem  chan struct{}
-	writeWG   sync.WaitGroup
-	opScratch sync.Pool
-	scratch   []byte
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	readSem    chan struct{}
+	writeSem   chan struct{}
+	writeWG    sync.WaitGroup
+	opScratch  *scratchList
+	reqScratch *scratchList // whole-frame buffers for large inbound requests (writes)
+	scratch    []byte
 }
 
 // blockCallerReadSlots bounds concurrent read handlers at the caller. A var (not
@@ -97,26 +102,113 @@ func (s *blockServer) unitSize() int64 {
 type bsHandle struct {
 	file p9.File
 	rel  string // path from the export root (for the per-file seq key)
+
+	// ro is a lazily opened read-only clone of file, used only when file itself
+	// cannot be read — see readAt.
+	roMu  sync.Mutex
+	ro    p9.File
+	roErr error
+}
+
+// readAt reads from the handle's file, transparently opening a read-only clone if
+// the handle the proxy opened cannot be read.
+//
+// Coherence hashing has to read bytes the write did NOT cover, and a workload
+// that writes a file with dd(1) or a shell `>` redirect opens it O_WRONLY — which
+// the kernel passes through, so the caller's handle is write-only and the
+// read-back fails EBADF. That surfaced as an ordinary append failing EIO on a
+// CACHED mount, on the second write to a file (the first covers the whole valid
+// block and needs no read-back, which is why it took two).
+//
+// Cloning the handle rather than re-walking the path keeps it pointing at the
+// same file the proxy is writing to.
+func (h *bsHandle) readAt(p []byte, off int64) (int, error) {
+	n, err := h.file.ReadAt(p, off)
+	if err == nil || !errnoIsUnreadable(err) {
+		return n, err
+	}
+	ro, rerr := h.readOnly()
+	if rerr != nil {
+		return n, err // the original refusal is the more informative one
+	}
+	return ro.ReadAt(p, off)
+}
+
+func (h *bsHandle) readOnly() (p9.File, error) {
+	h.roMu.Lock()
+	defer h.roMu.Unlock()
+	if h.ro != nil {
+		return h.ro, nil
+	}
+	if h.roErr != nil {
+		return nil, h.roErr
+	}
+	_, c, err := h.file.Walk(nil)
+	if err != nil {
+		h.roErr = err
+		return nil, err
+	}
+	if _, _, err := c.Open(p9.ReadOnly); err != nil {
+		c.Close()
+		h.roErr = err
+		return nil, err
+	}
+	h.ro = c
+	return c, nil
+}
+
+func (h *bsHandle) close() {
+	h.roMu.Lock()
+	ro := h.ro
+	h.ro = nil
+	h.roMu.Unlock()
+	if ro != nil {
+		_ = ro.Close()
+	}
+	_ = h.file.Close()
+}
+
+// errnoIsUnreadable reports whether err is the kernel refusing a read because of
+// how the descriptor was opened, rather than a real I/O failure.
+func errnoIsUnreadable(err error) bool {
+	switch linux.ExtractErrno(err) {
+	case linux.EBADF, linux.EACCES, linux.EPERM, linux.EINVAL:
+		return true
+	}
+	return false
 }
 
 // ServeBlockServer runs the caller endpoint over conn for the export rooted at
 // dir, using chunkSize as the block size. It returns when the connection ends.
 func ServeBlockServer(conn net.Conn, dir string, chunkSize int64, opts ...BlockOpt) {
+	att, err := writableConfinedAttacher(dir)
+	if err != nil {
+		return
+	}
+	serveBlockServerFS(conn, att, chunkSize, opts...)
+}
+
+// serveBlockServerFS is ServeBlockServer against an already-built attacher. The
+// seam exists for the mount benchmarks, which wrap the export to count the file
+// syscalls each protocol costs — the numbers that say whether an optimization
+// moved work off the disk or just around inside the process.
+func serveBlockServerFS(conn net.Conn, att p9.Attacher, chunkSize int64, opts ...BlockOpt) {
 	if chunkSize <= 0 {
 		chunkSize = defaultBlockChunk
 	}
 	o := resolveBlockOpts(opts)
-	local := helloParams{version: blockProtoVersion, chunkSize: uint32(chunkSize), maxInflight: blockMaxInflight, features: o.features}
-	peer, err := blockServerHandshake(conn, local)
-	if err != nil {
-		return
-	}
-	att, err := writableConfinedAttacher(dir)
+	// FeatNoCache is advertised unconditionally: it is a capability this endpoint
+	// HAS, and only the proxy knows whether it applies (see FeatNoCache). The
+	// coherence bits stay preferences and must match at both ends.
+	local := helloParams{version: blockProtoVersion, chunkSize: uint32(chunkSize), maxInflight: blockMaxInflight, features: o.features | FeatNoCache}
+	br := bufio.NewReaderSize(conn, blockReadBuf)
+	peer, err := blockServerHandshake(conn, br, local)
 	if err != nil {
 		return
 	}
 	s := &blockServer{
 		conn:      conn,
+		br:        br,
 		chunkSize: chunkSize,
 		maxFrame:  int(chunkSize) + blockFrameSlack,
 		attacher:  att,
@@ -128,7 +220,8 @@ func ServeBlockServer(conn net.Conn, dir string, chunkSize int64, opts ...BlockO
 		writeSem:  make(chan struct{}, blockCallerWriteSlots),
 		scratch:   make([]byte, chunkSize),
 	}
-	s.opScratch.New = func() any { b := make([]byte, chunkSize); return &b }
+	s.opScratch = newScratchList(int(chunkSize), blockScratchKeep)
+	s.reqScratch = newScratchList(s.maxFrame, blockScratchKeep)
 	s.loop()
 }
 
@@ -137,7 +230,7 @@ const defaultBlockChunk = 1 << 20
 
 func (s *blockServer) loop() {
 	for {
-		f, err := readFrame(s.conn, s.maxFrame)
+		f, release, err := s.readRequest()
 		if err != nil {
 			return
 		}
@@ -149,23 +242,64 @@ func (s *blockServer) loop() {
 		case opRead, opReadRange, opStatBlock:
 			s.readSem <- struct{}{}
 			go func(f frame) {
-				defer func() { <-s.readSem }()
+				defer func() { <-s.readSem; release() }()
 				s.dispatch(f)
 			}(f)
 		case opWrite:
 			s.writeWG.Add(1)
 			s.writeSem <- struct{}{}
 			go func(f frame) {
-				defer func() { <-s.writeSem; s.writeWG.Done() }()
+				defer func() { <-s.writeSem; s.writeWG.Done(); release() }()
 				s.dispatch(f)
 			}(f)
 		case opFSync, opSetAttr:
 			s.writeWG.Wait() // barrier: see all prior writes, race none in flight
 			s.dispatch(f)
+			release()
 		default:
 			s.dispatch(f)
+			release()
 		}
 	}
+}
+
+// bigRequest is the payload size above which a request body is read into a pooled
+// buffer instead of a fresh allocation. Only a WRITE carries a body this large, so
+// in practice this is "recycle the megabyte a write arrives in".
+const bigRequest = 1 << 16
+
+// readRequest reads one request frame and returns it with a release func the
+// caller MUST invoke once the handler is done with f.payload.
+//
+// A write arrives with a block of the workload's data behind it, and allocating a
+// fresh buffer for every one of them was the single largest source of garbage on
+// this path. Recycling is safe because no handler retains the payload: the data is
+// written to the file and hashed in place, and every string field is copied out by
+// msgR.str.
+func (s *blockServer) readRequest() (frame, func(), error) {
+	h, err := readFrameHeader(s.br, s.maxFrame)
+	if err != nil {
+		return frame{}, nil, err
+	}
+	f := frame{op: h.op, flags: h.flags, reqID: h.reqID}
+	if h.plen == 0 {
+		return f, func() {}, nil
+	}
+	if h.plen <= bigRequest {
+		f.payload = make([]byte, h.plen)
+		if _, err := blitReadFull(blitWireRead, s.br, f.payload); err != nil {
+			return frame{}, nil, err
+		}
+		return f, func() {}, nil
+	}
+	bp := s.reqScratch.get()
+	f.payload = (*bp)[:h.plen]
+	if _, err := blitReadFull(blitWireRead, s.br, f.payload); err != nil {
+		s.reqScratch.put(bp)
+		return frame{}, nil, err
+	}
+	var once sync.Once
+	return f, func() { once.Do(func() { s.reqScratch.put(bp) }) }, nil
 }
 
 func (s *blockServer) reply(reqID uint64, payload []byte) {
@@ -175,8 +309,14 @@ func (s *blockServer) reply(reqID uint64, payload []byte) {
 }
 
 func (s *blockServer) replyFlags(reqID uint64, flags byte, payload []byte) {
+	s.replyParts(reqID, flags, payload, nil)
+}
+
+// replyParts is replyFlags with the bulk data written straight from the buffer it
+// was read into, instead of being copied into the payload.
+func (s *blockServer) replyParts(reqID uint64, flags byte, payload, bulk []byte) {
 	s.writeMu.Lock()
-	_ = writeFrame(s.conn, frame{op: opBlockResp, flags: flags, reqID: reqID, payload: payload})
+	_ = writeFrameParts(s.conn, frame{op: opBlockResp, flags: flags, reqID: reqID, payload: payload}, bulk)
 	s.writeMu.Unlock()
 }
 
@@ -272,7 +412,7 @@ func (s *blockServer) dispatch(f frame) {
 			s.replyErr(f.reqID, linux.EBADF)
 			return
 		}
-		qids, child, mask, attr, err := hn.file.WalkGetAttr(names)
+		qids, child, mask, attr, err := walkGetAttrLocal(hn.file, names)
 		if err != nil {
 			s.replyErr(f.reqID, err)
 			return
@@ -510,13 +650,43 @@ func (s *blockServer) dispatch(f frame) {
 	case opClunk:
 		h := r.u64()
 		if hn, ok := s.delHandle(h); ok {
-			_ = hn.file.Close()
+			hn.close()
 		}
 		s.reply(f.reqID, nil)
 
 	default:
 		s.replyErr(f.reqID, linux.ENOSYS)
 	}
+}
+
+// walkGetAttrLocal is file.WalkGetAttr with the ENOSYS fallback resolved HERE,
+// on the authoritative side, instead of being reported to the proxy.
+//
+// It matters because of where the fallback would otherwise run. p9's server does
+// Walk + GetAttr when WalkGetAttr returns ENOSYS (walkOne in handlers.go), and
+// the server in front of the block proxy is on the OTHER side of the link: one
+// Twalk became opWalkGetAttr -> ENOSYS, then opWalk, then opGetAttr — three round
+// trips to resolve one path element, on every walk. The raw 9P splice never pays
+// it, because there the same fallback happens at the caller with no hop at all.
+//
+// The export this serves (writableConfinedFile) embeds p9.DefaultWalkGetAttr,
+// which is exactly the ENOSYS case, so this is the normal path and not an
+// exotic one.
+func walkGetAttrLocal(file p9.File, names []string) ([]p9.QID, p9.File, p9.AttrMask, p9.Attr, error) {
+	qids, child, mask, attr, err := file.WalkGetAttr(names)
+	if !errors.Is(err, linux.ENOSYS) {
+		return qids, child, mask, attr, err
+	}
+	qids, child, err = file.Walk(names)
+	if err != nil {
+		return nil, nil, p9.AttrMask{}, p9.Attr{}, err
+	}
+	_, mask, attr, err = child.GetAttr(p9.AttrMaskAll)
+	if err != nil {
+		child.Close()
+		return nil, nil, p9.AttrMask{}, p9.Attr{}, err
+	}
+	return qids, child, mask, attr, nil
 }
 
 // fileSize returns the current logical size of a file via GetAttr.
@@ -563,8 +733,8 @@ func (s *blockServer) readBlock(f p9.File, blockIdx int64, size int64, scratch [
 // opScratchBuf borrows a pooled chunk-sized buffer for a concurrent handler; the
 // returned put func returns it to the pool.
 func (s *blockServer) opScratchBuf() (scratch []byte, put func()) {
-	bp := s.opScratch.Get().(*[]byte)
-	return *bp, func() { s.opScratch.Put(bp) }
+	bp := s.opScratch.get()
+	return *bp, func() { s.opScratch.put(bp) }
 }
 
 // readScratchBuf is opScratchBuf plus the read test-hook (simulated read cost).
@@ -616,8 +786,8 @@ func (s *blockServer) handleRead(reqID uint64, r *msgR) {
 		w.u64(uint64(b))
 		w.u64(seq)
 		w.u64(hash)
-		w.blob(data)
-		s.replyFlags(reqID, flags, w.b)
+		w.u32(uint32(len(data)))
+		s.replyParts(reqID, flags, w.b, data)
 		if final {
 			return
 		}
@@ -645,10 +815,17 @@ func (s *blockServer) handleWrite(reqID uint64, r *msgR) {
 		return
 	}
 	seq := s.bumpSeq(hn.rel)
-	size, mtimeNs, err := fileSizeMTime(hn.file)
-	if err != nil {
-		s.replyErr(reqID, err)
-		return
+	// size/mtime exist to key and validate the proxy's cache entry. Under
+	// FeatNoCache there is none — every file is non-cacheable there, so the proxy
+	// reads these fields off the reply and returns without using them — and this
+	// is a stat syscall on every write.
+	var size, mtimeNs int64
+	if s.features&FeatNoCache == 0 {
+		var err error
+		if size, mtimeNs, err = fileSizeMTime(hn.file); err != nil {
+			s.replyErr(reqID, err)
+			return
+		}
 	}
 	var w msgW
 	w.u32(uint32(n))
@@ -657,6 +834,11 @@ func (s *blockServer) handleWrite(reqID uint64, r *msgR) {
 	w.u64(seq)
 
 	switch {
+	case s.features&FeatNoCache != 0:
+		// The proxy retains nothing, so there is no cache to keep coherent. Skip the
+		// hash entirely — the whole-block hash of a straddling write would read a
+		// megabyte back off disk to produce a number the proxy discards.
+		w.u16(0)
 	case s.features&FeatDeferHash != 0:
 		// Deferred coherence: no hashing on the write. Record the dirty units so
 		// fsync can hash each once and reconcile the proxy cache in a batch.
@@ -666,7 +848,7 @@ func (s *blockServer) handleWrite(reqID uint64, r *msgR) {
 		// Sub-block coherence: hash only the touched sub-blocks (subBlockSize), so a
 		// small page write costs a sub-block read+hash, not a whole 1 MiB one.
 		scratch, put := s.opScratchBuf()
-		units, herr := s.writeUnits(hn.file, data, off, int64(n), size, scratch)
+		units, herr := s.writeUnits(hn, data, off, int64(n), size, scratch)
 		put()
 		if herr != nil {
 			s.replyErr(reqID, herr)
@@ -689,7 +871,7 @@ func (s *blockServer) handleWrite(reqID uint64, r *msgR) {
 				if blockStart >= blockValidEnd {
 					continue
 				}
-				hash, herr := s.unitHashCovering(hn.file, blockStart, blockValidEnd-blockStart, data, off, int64(n), scratch)
+				hash, herr := s.unitHashCovering(hn, blockStart, blockValidEnd-blockStart, data, off, int64(n), scratch)
 				if herr != nil {
 					put()
 					s.replyErr(reqID, herr)
@@ -734,21 +916,23 @@ func putUnitHashes(w *msgW, units []unitHash) {
 // the common case for a sequential / full-block write — it hashes the write buffer
 // directly, avoiding a read-back of bytes we just wrote (which on DiskStore is a
 // whole extra disk read per write). A partial-edge unit is read from the file.
-func (s *blockServer) unitHashCovering(f p9.File, absOff, length int64, data []byte, off, n int64, scratch []byte) (uint64, error) {
+func (s *blockServer) unitHashCovering(hn *bsHandle, absOff, length int64, data []byte, off, n int64, scratch []byte) (uint64, error) {
 	if off <= absOff && absOff+length <= off+n {
 		lo := absOff - off
 		return blockcache.HashChunk(data[lo : lo+length]), nil
 	}
-	return s.hashUnit(f, absOff, length, scratch)
+	return s.hashUnit(hn, absOff, length, scratch)
 }
 
-// hashUnit reads [absOff, absOff+length) of f into the caller-provided scratch
-// buffer and returns its xxh3 hash. length must be <= chunkSize (scratch's
-// capacity). scratch is a pooled per-writer buffer (concurrent write handlers) or,
-// on the serial fsync-drain path, the blockServer's own `scratch`.
-func (s *blockServer) hashUnit(f p9.File, absOff, length int64, scratch []byte) (uint64, error) {
+// hashUnit reads [absOff, absOff+length) of the handle's file into the
+// caller-provided scratch buffer and returns its xxh3 hash. length must be <=
+// chunkSize (scratch's capacity). scratch is a pooled per-writer buffer
+// (concurrent write handlers) or, on the serial fsync-drain path, the
+// blockServer's own `scratch`. It reads via bsHandle.readAt, so a file the
+// workload opened write-only can still be hashed.
+func (s *blockServer) hashUnit(hn *bsHandle, absOff, length int64, scratch []byte) (uint64, error) {
 	buf := scratch[:length]
-	n, err := f.ReadAt(buf, absOff)
+	n, err := hn.readAt(buf, absOff)
 	if err != nil && err != io.EOF {
 		return 0, err
 	}
@@ -802,14 +986,14 @@ func (s *blockServer) forEachWriteUnit(off, n, size int64, fn func(blockIdx, sub
 // writeUnits hashes each coherence unit touched by [off, off+n) and returns their
 // (blockIdx, subOff, subLen, hash) — the inline FeatSubBlockHash write reply. Units
 // the write fully covers are hashed straight from the write buffer (no read-back).
-func (s *blockServer) writeUnits(f p9.File, data []byte, off, n, size int64, scratch []byte) ([]unitHash, error) {
+func (s *blockServer) writeUnits(hn *bsHandle, data []byte, off, n, size int64, scratch []byte) ([]unitHash, error) {
 	var out []unitHash
 	var ferr error
 	s.forEachWriteUnit(off, n, size, func(blockIdx, subOff, length int64) {
 		if ferr != nil {
 			return
 		}
-		h, err := s.unitHashCovering(f, blockIdx*s.chunkSize+subOff, length, data, off, n, scratch)
+		h, err := s.unitHashCovering(hn, blockIdx*s.chunkSize+subOff, length, data, off, n, scratch)
 		if err != nil {
 			ferr = err
 			return
@@ -836,18 +1020,18 @@ func (s *blockServer) markDirty(rel string, off, n, size int64) {
 	})
 }
 
-// drainDirtyUnits removes rel's dirty set and hashes each recorded unit once
-// against the now-durable file, returning the (blockIdx, subOff, subLen, hash)
-// list to reconcile. Units past EOF (a later shrink) are skipped.
-func (s *blockServer) drainDirtyUnits(f p9.File, rel string, scratch []byte) ([]unitHash, error) {
+// drainDirtyUnits removes the handle's dirty set and hashes each recorded unit
+// once against the now-durable file, returning the (blockIdx, subOff, subLen,
+// hash) list to reconcile. Units past EOF (a later shrink) are skipped.
+func (s *blockServer) drainDirtyUnits(hn *bsHandle, scratch []byte) ([]unitHash, error) {
 	s.mu.Lock()
-	offs := s.dirty[rel]
-	delete(s.dirty, rel)
+	offs := s.dirty[hn.rel]
+	delete(s.dirty, hn.rel)
 	s.mu.Unlock()
 	if len(offs) == 0 {
 		return nil, nil
 	}
-	size, err := fileSize(f)
+	size, err := fileSize(hn.file)
 	if err != nil {
 		return nil, err
 	}
@@ -870,7 +1054,7 @@ func (s *blockServer) drainDirtyUnits(f p9.File, rel string, scratch []byte) ([]
 		if length <= 0 {
 			continue
 		}
-		h, herr := s.hashUnit(f, uo, length, scratch)
+		h, herr := s.hashUnit(hn, uo, length, scratch)
 		if herr != nil {
 			return nil, herr
 		}
@@ -900,7 +1084,7 @@ func (s *blockServer) handleFSync(reqID uint64, r *msgR) {
 	}
 	// Serial-after-barrier (loop goroutine, in-flight writes drained), so the single
 	// `scratch` is exclusive here and needs no pooled buffer.
-	units, err := s.drainDirtyUnits(hn.file, hn.rel, s.scratch)
+	units, err := s.drainDirtyUnits(hn, s.scratch)
 	if err != nil {
 		s.replyErr(reqID, err)
 		return
@@ -960,8 +1144,10 @@ func (s *blockServer) handleReadRange(reqID uint64, r *msgR) {
 	w.u64(uint64(blockIdx))
 	w.u32(uint32(subOff))
 	w.u64(s.seqOf(hn.rel))
-	w.blob(buf[:n])
-	s.reply(reqID, w.b)
+	w.u32(uint32(n))
+	// The data goes out as the frame's bulk part, straight from the scratch buffer
+	// it was read into — appending it to w would copy a block per read.
+	s.replyParts(reqID, flagFinal, w.b, buf[:n])
 }
 
 func (s *blockServer) handleStatBlock(reqID uint64, r *msgR) {

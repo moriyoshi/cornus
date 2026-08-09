@@ -116,6 +116,25 @@ require (
 // 16 MiB window on every stream. See .agents/docs/JOURNAL.md.
 replace github.com/hashicorp/yamux => ./third_party/yamux
 
+// p9 is vendored in-repo (third_party/p9) as a fork: its server allocated a fresh
+// payload buffer for every Twrite — about one payload-sized allocation per write,
+// measured at 69% of the allocated bytes on cornus's client-local mount write path
+// — because the message cache nils the payload before reuse. The fork serves that
+// payload from the receiving CONNECTION's buffer pool instead, mirroring what
+// upstream already does for reads (rreadServerPayloader). See
+// third_party/p9/README.md for the patch and .agents/docs/JOURNAL.md for the
+// measurement.
+replace github.com/hugelgupf/p9 => ./third_party/p9
+
+// coder/websocket is vendored in-repo (third_party/websocket) as a fork: it adds
+// DialOptions.WriteBufferSize. A WebSocket CLIENT must mask everything it sends
+// and coder/websocket masks and flushes in chunks bounded by a hardcoded 4 KiB
+// buffer, so the deploy caller paid one write syscall per 4 KiB of every read
+// reply — about a third of the syscall time on that path. The buffer is not
+// reachable through any exported option upstream. See
+// third_party/websocket/README.md.
+replace github.com/coder/websocket => ./third_party/websocket
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.123.0 // indirect
